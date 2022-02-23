@@ -535,14 +535,16 @@ def log_model_info(log_file: str, full_train_state: train_state_lib.TrainState,
     return
 
   state_dict = full_train_state.state_dict()
+  param_state_dict = state_dict['target']
   total_num_params = jax.tree_util.tree_reduce(
-      np.add, jax.tree_map(np.size, state_dict['target']))
+      np.add, jax.tree_map(np.size, param_state_dict))
 
-  logical_axes = partitioner.get_logical_axes(full_train_state).state_dict()
+  param_logical_axes = partitioner.get_logical_axes(
+      full_train_state).state_dict()['target']
 
-  mesh_axes = jax.tree_map(
+  param_mesh_axes = jax.tree_map(
       lambda x: tuple(x) if x is not None else None,
-      partitioner.get_mesh_axes(full_train_state).state_dict())
+      partitioner.get_mesh_axes(full_train_state).state_dict()['target'])
 
   def _log_info_and_write_to_file(writer, format_str, *args):
     logging.info(format_str, *args)
@@ -551,12 +553,9 @@ def log_model_info(log_file: str, full_train_state: train_state_lib.TrainState,
   with gfile.GFile(log_file, 'w') as writer:
 
     # Log params
-    def _log_variable(name: str, arr: Optional[np.ndarray],
-                      logical_axes: Optional[partitioning.AxisNames],
-                      mesh_axes: Optional[partitioning.PartitionSpec]):
-      if arr is None:
-        _log_info_and_write_to_file(writer, 'Variable    %-80s None', name)
-        return
+    def _log_param(name: str, arr: np.ndarray,
+                   logical_axes: Optional[partitioning.AxisNames],
+                   mesh_axes: Optional[partitioning.PartitionSpec]):
       if logical_axes is None:
         shape_str = str(arr.shape)
       else:
@@ -568,9 +567,8 @@ def log_model_info(log_file: str, full_train_state: train_state_lib.TrainState,
           writer, 'Variable %-80s size %-12s shape %-40s partition spec %s',
           name, arr.size, shape_str, mesh_axes)
 
-    jax.tree_map(_log_variable, state_utils.get_name_tree(state_dict['target']),
-                 state_dict['target'], logical_axes['target'],
-                 mesh_axes['target'])
+    jax.tree_map(_log_param, state_utils.get_name_tree(param_state_dict),
+                 param_state_dict, param_logical_axes, param_mesh_axes)
 
     _log_info_and_write_to_file(writer, 'Total number of parameters: %d',
                                 total_num_params)
@@ -578,8 +576,17 @@ def log_model_info(log_file: str, full_train_state: train_state_lib.TrainState,
     # Add a blank line between params and states.
     _log_info_and_write_to_file(writer, '')
 
-    jax.tree_map(_log_variable, state_utils.get_name_tree(state_dict['state']),
-                 state_dict['state'], logical_axes['state'], mesh_axes['state'])
+    # Log states
+    def _log_state(name, arr):
+      if arr is None:
+        _log_info_and_write_to_file(writer, 'State    %-80s None', name)
+      else:
+        _log_info_and_write_to_file(writer,
+                                    'State    %-80s size %-12s shape %s', name,
+                                    arr.size, arr.shape)
+
+    jax.tree_map(_log_state, state_utils.get_name_tree(state_dict['state']),
+                 state_dict['state'])
 
 
 # -----------------------------------------------------------------------------

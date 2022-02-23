@@ -31,11 +31,16 @@ import tensorstore as ts
 class LazyArray(abc.ABC):
   """Lazily and asynchronously loads an array."""
 
-  def __init__(self, shape: Sequence[int], dtype: jnp.dtype,
-               get_fn: Callable[[], np.ndarray]):
+  def __init__(self,
+               shape: Sequence[int],
+               dtype: jnp.dtype,
+               get_fn: Callable[[], np.ndarray],
+               cast_fn: Optional[Callable[[np.ndarray, Any],
+                                          np.ndarray]] = None):
     self._shape = tuple(shape)
     self._dtype = jnp.dtype(dtype)
     self._get_fn = get_fn
+    self._cast_fn = cast_fn
 
   @property
   def shape(self) -> Tuple[int, ...]:
@@ -83,7 +88,10 @@ class LazyThreadPoolArray(LazyArray):
   def get(self) -> np.ndarray:
     arr = self._get_fn()
     if arr.dtype != self.dtype:
-      arr = arr.astype(self.dtype)
+      if self._cast_fn is None:
+        arr = arr.astype(self.dtype)
+      else:
+        arr = self._cast_fn(arr, self.dtype)
     return arr
 
 
@@ -113,7 +121,11 @@ class LazyAwaitableArray(LazyArray):
       # https://github.com/google/pytype/issues/527
       arr = await self._get_fn()  # pytype: disable=bad-return-type
       if arr.dtype != self.dtype:
-        arr = arr.astype(self.dtype)
+        if self._cast_fn is None:
+          arr = arr.astype(self.dtype)
+        else:
+          arr = self._cast_fn(arr, self.dtype)
+      assert arr.dtype == self.dtype
       return arr
 
     return asyncio.ensure_future(_get_and_cast())
@@ -124,8 +136,11 @@ class LazyAwaitableArray(LazyArray):
 
   @classmethod
   def from_tensor_store_spec(
-      cls, ts_spec: ts.Spec,
-      get_fn: Callable[[], np.ndarray]) -> 'LazyAwaitableArray':
+      cls,
+      ts_spec: ts.Spec,
+      get_fn: Callable[[], np.ndarray],
+      cast_fn: Optional[Callable[[np.ndarray, Any], np.ndarray]] = None
+  ) -> 'LazyAwaitableArray':
     """Create a LazyAwaitableArray based on a tensorstore.Spec."""
     ts_spec = ts_spec.to_json()
     shape = ts_spec['metadata']['shape']
@@ -139,22 +154,29 @@ class LazyAwaitableArray(LazyArray):
     # zeros. This check avoid the actual cast to uint16 by replacing the dtype.
     if dtype == np.uint16:
       dtype = jnp.bfloat16
-    return cls(shape, dtype, get_fn)
+    return cls(shape, dtype, get_fn, cast_fn=cast_fn)
 
   @classmethod
-  def from_array(cls, array: np.ndarray,
-                 get_fn: Callable[[], np.ndarray]) -> 'LazyAwaitableArray':
+  def from_array(
+      cls,
+      array: np.ndarray,
+      get_fn: Callable[[], np.ndarray],
+      cast_fn: Optional[Callable[[np.ndarray, Any], np.ndarray]] = None
+  ) -> 'LazyAwaitableArray':
     """Create a LazyAwaitableArray based on an array or python number."""
-    return cls(array.shape, array.dtype, get_fn)
+    return cls(array.shape, array.dtype, get_fn, cast_fn=cast_fn)
 
   @classmethod
   def from_tensor_store_spec_or_array(
-      cls, maybe_ts_spec: Union[ts.Spec, np.ndarray],
-      get_fn: Callable[[], np.ndarray]) -> 'LazyAwaitableArray':
+      cls,
+      maybe_ts_spec: Union[ts.Spec, np.ndarray],
+      get_fn: Callable[[], np.ndarray],
+      cast_fn: Optional[Callable[[np.ndarray, Any], np.ndarray]] = None
+  ) -> 'LazyAwaitableArray':
     """Create a LazyAwaitableArray based on an array or a tensorstore.Spec."""
     if isinstance(maybe_ts_spec, ts.Spec):
-      return cls.from_tensor_store_spec(maybe_ts_spec, get_fn)
-    return cls.from_array(maybe_ts_spec, get_fn)
+      return cls.from_tensor_store_spec(maybe_ts_spec, get_fn, cast_fn=cast_fn)
+    return cls.from_array(maybe_ts_spec, get_fn, cast_fn=cast_fn)
 
 
 class CheckpointTranslator:
