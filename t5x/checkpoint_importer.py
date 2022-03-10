@@ -82,8 +82,9 @@ class LazyThreadPoolArray(LazyArray):
 
   def get(self) -> np.ndarray:
     arr = self._get_fn()
-    if arr.dtype != self.dtype:
-      arr = arr.astype(self.dtype)
+    # Casting may occur in _get_fn, causing loaded type to be different than
+    # stored type.
+    self._dtype = arr.dtype
     return arr
 
 
@@ -112,8 +113,9 @@ class LazyAwaitableArray(LazyArray):
       # wrapping it in an Awaitable. Related to this bug
       # https://github.com/google/pytype/issues/527
       arr = await self._get_fn()  # pytype: disable=bad-return-type
-      if arr.dtype != self.dtype:
-        arr = arr.astype(self.dtype)
+      # Casting may occur in _get_fn, causing loaded type to be different than
+      # stored type.
+      self._dtype = arr.dtype
       return arr
 
     return asyncio.ensure_future(_get_and_cast())

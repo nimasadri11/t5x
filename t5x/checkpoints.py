@@ -183,6 +183,8 @@ def get_checkpoint_dir(checkpoints_dir: str, step: int) -> str:
   return os.path.join(checkpoints_dir, f'checkpoint_{step}')
 
 
+# Cast is performed using tensorstore for partitioned arrays.
+# Only cast array if it will not be written / read using tensorstore.
 def _cast(target: PyTreeDef, dtype: jnp.dtype):
   """Cast arrays in target to dtype."""
 
@@ -449,7 +451,6 @@ class Checkpointer(object):
 
     if lazy_load:
       state_dict = jax.tree_map(_lazy_load_device_array, state_dict)
-    state_dict['target'] = _cast(state_dict['target'], self._save_dtype)
     return state_dict
 
   def _get_parameter_infos(self):
@@ -688,7 +689,21 @@ class Checkpointer(object):
 
         # Path and gcs bucket (if applicable) information is updated in-place.
         _update_ts_path_from_relative_to_absolute(ckpt_dir, tmp_ts_spec_dict)
-        assert tmp_ts_spec_dict['metadata']['dtype'] == np.dtype(arr.dtype)
+
+        if self._save_dtype == jnp.bfloat16:
+          dtype_name = 'bfloat16'
+          dtype_str = dtype_name
+        else:
+          dtype_name = np.dtype(self._save_dtype).name
+          dtype_str = np.dtype(self._save_dtype).str
+
+        tmp_ts_spec_dict = {'base': tmp_ts_spec_dict}
+        tmp_ts_spec_dict['driver'] = 'cast'
+        # origin dtype
+        tmp_ts_spec_dict['dtype'] = np.dtype(arr.dtype).name
+        # destination dtype
+        tmp_ts_spec_dict['base']['dtype'] = dtype_name
+        tmp_ts_spec_dict['base']['metadata']['dtype'] = dtype_str
 
         t = await ts.open(
             tmp_ts_spec_dict,
@@ -713,9 +728,18 @@ class Checkpointer(object):
                                         self._parameter_infos,
                                         state_transformation_fns))
 
-    future_written_state = jax.tree_multimap(
-        _write_array, self._get_state_dict_for_save(transformed_state_dict),
-        transformed_parameter_infos)
+    state_dict_for_save = self._get_state_dict_for_save(transformed_state_dict)
+
+    def _cast_arr_if_non_partitioned(maybe_arr, param_info):
+      if param_info is None or param_info.ts_spec is None:
+        return _cast(maybe_arr, self._save_dtype)
+      return maybe_arr
+
+    state_dict_for_save['target'] = jax.tree_multimap(
+        _cast_arr_if_non_partitioned, state_dict_for_save['target'],
+        transformed_parameter_infos['target'])
+    future_written_state = jax.tree_multimap(_write_array, state_dict_for_save,
+                                             transformed_parameter_infos)
 
     # Block until complete on this host.
     written_state_dict = _run_future_tree(future_written_state)
@@ -905,8 +929,11 @@ class Checkpointer(object):
 
     # Replace TensorStore Specs with the lazy array values.
     state_dict = jax.tree_multimap(
-        functools.partial(_create_lazy_awaitable_array, ckpt_path=ckpt_path),
-        restore_parameter_infos, written_state_dict)
+        functools.partial(
+            _create_lazy_awaitable_array,
+            ckpt_path=ckpt_path,
+            restore_dtype=self.restore_dtype), restore_parameter_infos,
+        written_state_dict)
 
     if not lazy_parameters:
       future_state_dict = jax.tree_map(lambda x: x.get_async(), state_dict)
@@ -1182,8 +1209,8 @@ def _get_optimizer_state_dict(
                      f'Got version: {version}')
 
 
-async def _read_ts(param_info: _ParameterInfo, maybe_tspec: Any,
-                   ckpt_path: str):
+async def _read_ts(param_info: _ParameterInfo, maybe_tspec: Any, ckpt_path: str,
+                   restore_dtype: Optional[jnp.dtype]):
   """Read from a tensorstore.
 
   Note:
@@ -1203,6 +1230,7 @@ async def _read_ts(param_info: _ParameterInfo, maybe_tspec: Any,
       (provided the param_info says to). Anything else we just return.
     ckpt_path: A base location to use when resolving the relative paths in the
       tensorstore spec.
+    restore_dtype: type to restore as. None indicates that no cast is requested.
 
   Returns:
     The array. Depending on the value `maybe_tspec` it might be read from
@@ -1234,6 +1262,9 @@ async def _read_ts(param_info: _ParameterInfo, maybe_tspec: Any,
   _update_ts_path_from_relative_to_absolute(
       os.path.dirname(ckpt_path), tmp_ts_spec_dict)
 
+  del tmp_ts_spec_dict['dtype']
+  del tmp_ts_spec_dict['metadata']['dtype']
+
   if param_info.shape is not None:
     ts_spec_arr_shape = tuple(tmp_ts_spec_dict['metadata']['shape'])
     # Check that the shapes of the array on disk match the expected shape based
@@ -1242,6 +1273,12 @@ async def _read_ts(param_info: _ParameterInfo, maybe_tspec: Any,
       raise ValueError(f'Shape of `{param_info.name}` in checkpoint '
                        f'{ts_spec_arr_shape} does not match expected '
                        f'{param_info.shape}.')
+
+  if restore_dtype is not None:
+    tmp_ts_spec_dict = {'base': tmp_ts_spec_dict}
+    tmp_ts_spec_dict['driver'] = 'cast'
+    tmp_ts_spec_dict['dtype'] = np.dtype(restore_dtype).name
+
   # Read the array.
   t = await ts.open(tmp_ts_spec_dict, open=True)
   if param_info.local_chunk_info is not None:
@@ -1257,10 +1294,15 @@ async def _read_ts(param_info: _ParameterInfo, maybe_tspec: Any,
   return arr
 
 
-def _create_lazy_awaitable_array(param_info: _ParameterInfo, maybe_ts_spec: Any,
-                                 ckpt_path: str) -> LazyAwaitableArray:
+def _create_lazy_awaitable_array(
+    param_info: _ParameterInfo, maybe_ts_spec: Any, ckpt_path: str,
+    restore_dtype: jnp.dtype) -> LazyAwaitableArray:
   get_fn = functools.partial(
-      _read_ts, param_info, maybe_ts_spec, ckpt_path=ckpt_path)
+      _read_ts,
+      param_info,
+      maybe_ts_spec,
+      ckpt_path=ckpt_path,
+      restore_dtype=restore_dtype)
   return LazyAwaitableArray.from_tensor_store_spec_or_array(
       maybe_ts_spec, get_fn)
 
@@ -1404,13 +1446,14 @@ def load_t5x_checkpoint(
   param_infos = traverse_util.unflatten_dict(param_infos, sep='/')
 
   state_dict = jax.tree_multimap(
-      functools.partial(_create_lazy_awaitable_array, ckpt_path=path),
-      param_infos, ckpt_optimizer_state_with_specs)
+      functools.partial(
+          _create_lazy_awaitable_array,
+          ckpt_path=path,
+          restore_dtype=restore_dtype), param_infos,
+      ckpt_optimizer_state_with_specs)
 
   if not lazy_parameters:
     future_state_dict = jax.tree_map(lambda x: x.get_async(), state_dict)
     state_dict = _run_future_tree(future_state_dict)
 
-  if restore_dtype is not None:
-    state_dict['target'] = _cast(state_dict['target'], restore_dtype)
   return state_dict
