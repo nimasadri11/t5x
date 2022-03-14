@@ -943,6 +943,10 @@ def get_training_eval_datasets(
   """Returns a mapping from eval task name to its dataset."""
   mixture_or_task = seqio.get_mixture_or_task(cfg.mixture_or_task_name)
   datasets = {}
+
+  def _repeat_shard_take_cache(ds):
+    return ds.repeat().shard(num_shards, shard_id).take(eval_steps).cache()
+
   for task in seqio.get_subtasks(mixture_or_task):
     if cfg.split not in task.splits:
       logging.info("Task %s has no '%s' split; skipping training evaluation.",
@@ -952,26 +956,26 @@ def get_training_eval_datasets(
     task_cfg = dataclasses.replace(cfg, mixture_or_task_name=task.name)
     # We set `num_epochs=eval_steps` to avoid infinite loops on shards that have
     # input examples but are filtered to be empty.
-    datasets[task.name] = get_dataset_fn(
-        task_cfg,
-        # We apply sharding later to avoid uneven file shards.
-        shard_id=0,
-        num_shards=1,
-        feature_converter_cls=feature_converter_cls,
-        num_epochs=eval_steps,
-        continue_from_last_checkpoint=False).repeat().shard(
-            num_shards, shard_id).take(eval_steps)
+    datasets[task.name] = _repeat_shard_take_cache(
+        get_dataset_fn(
+            task_cfg,
+            # We apply sharding later to avoid uneven file shards.
+            shard_id=0,
+            num_shards=1,
+            feature_converter_cls=feature_converter_cls,
+            num_epochs=eval_steps,
+            continue_from_last_checkpoint=False))
 
   if isinstance(mixture_or_task, seqio.Mixture):
-    datasets[mixture_or_task.name] = get_dataset_fn(
-        cfg,
-        # We apply sharding later to avoid uneven file shards.
-        shard_id=0,
-        num_shards=1,
-        feature_converter_cls=feature_converter_cls,
-        num_epochs=eval_steps,
-        continue_from_last_checkpoint=False).repeat().shard(
-            num_shards, shard_id).take(eval_steps)
+    datasets[mixture_or_task.name] = _repeat_shard_take_cache(
+        get_dataset_fn(
+            cfg,
+            # We apply sharding later to avoid uneven file shards.
+            shard_id=0,
+            num_shards=1,
+            feature_converter_cls=feature_converter_cls,
+            num_epochs=eval_steps,
+            continue_from_last_checkpoint=False))
 
   return datasets
 
