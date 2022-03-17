@@ -19,11 +19,20 @@ for line in lines:
     rels[query].add(pos)
     not_rels[query].add(neg)
 
+train_so_far = 0
+train_f = open('train.tsv', 'a+')
+test_f = open('test.tsv', 'a+')
+fw = train_f
+train_ratio = 0.8
 for q in qs:
+    if (train_ratio * len(qs)) <= train_so_far:
+        fw = test_f
+    else:
+        train_so_far += 1
     pos_set = rels[q]
     neg_set = not_rels[q]
     for pos in pos_set:
-        print(q, '\t', pos, '\t', 1)
+        print(q, '\t', pos, '\t', 1, file=fw)
     for neg in neg_set:
-        print(q, '\t', neg, '\t', 0)
+        print(q, '\t', neg, '\t', 0, file=fw)
 
