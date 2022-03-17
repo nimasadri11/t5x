@@ -1,0 +1,3 @@
+[submodule "emdt5x"]
+	path = emdt5x
+	url = https://github.com/ronakice/emdt5x.git
