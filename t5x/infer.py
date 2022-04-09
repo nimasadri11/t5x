@@ -365,6 +365,7 @@ def infer(
     infer_step = model.predict_batch_with_aux
   else:  # mode == 'score'
     infer_step = model.score_batch
+  print("NIMA_MODE: ", mode)
 
   infer_fn = functools.partial(
       utils.get_infer_fn(
@@ -457,6 +458,8 @@ def infer(
 
       logging.info('Running inference on %d batches.', checkpoint_period)
       # Sort by and strip index.
+      nima_out = infer_fn(model_ds.enumerate(), rng=chunk_rng)
+      print("NIMA_OUT: ", nima_out)
       inferences = [
           x[1] for x in sorted(
               infer_fn(model_ds.enumerate(), rng=chunk_rng), key=lambda x: x[0])

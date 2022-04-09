@@ -124,6 +124,7 @@ def compute_weighted_cross_entropy(
   Returns:
     Tuple of scalar loss, z_loss, and weight sum.
   """
+  print("LOGITS: ", logits.shape)
   if logits.ndim != targets.ndim + 1:
     raise ValueError('Incorrect shapes. Got shape %s logits and %s targets' %
                      (str(logits.shape), str(targets.shape)))

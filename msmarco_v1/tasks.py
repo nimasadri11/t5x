@@ -27,6 +27,7 @@ def relevance(dataset: tf.data.Dataset) -> tf.data.Dataset:
 
 vocabulary = seqio.SentencePieceVocabulary(
     'gs://t5-data/vocabs/cc_all.32000/sentencepiece.model', extra_ids=100)
+print("NIMA_VOCAB: ", vocabulary)
 output_features = {
     'inputs': seqio.Feature(vocabulary=vocabulary),
     'targets': seqio.Feature(vocabulary=vocabulary),

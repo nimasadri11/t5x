@@ -11,8 +11,8 @@ include "t5x/examples/t5/t5_1_1/base.gin"
 include "t5x/configs/runs/pretrain.gin"
 
 MIXTURE_OR_TASK_NAME = "msmarco_v1"
-TASK_FEATURE_LENGTHS = {"inputs": 256, "targets": 256}
-TRAIN_STEPS = 50000
+TASK_FEATURE_LENGTHS = {"inputs": 512, "targets": 2}
+TRAIN_STEPS = 100000
 DROPOUT_RATE = 0.0
 
 train/utils.DatasetConfig:
@@ -37,7 +37,7 @@ infer_eval/utils.DatasetConfig:
   use_cached = False
 
 train_script.train:
-  eval_period = 500
+  eval_period = 100000
   eval_steps = 20
   random_seed = 0
   use_hardware_rng = True
@@ -50,7 +50,7 @@ seqio.Evaluator:
   use_memory_cache = True
 
 utils.SaveCheckpointConfig:
-  period = 5000  # checkpoint frequency
+  period = 10000  # checkpoint frequency
 
 # `num_decodes` is equivalent to a beam size in a beam search decoding.
 models.EncoderDecoderModel.predict_batch_with_aux.num_decodes = 4
@@ -58,6 +58,6 @@ models.EncoderDecoderModel.predict_batch_with_aux.num_decodes = 4
 partitioning.PjitPartitioner.num_partitions = 2
 
 utils.create_learning_rate_scheduler:
-  factors = 'constant * rsqrt_decay'
-  base_learning_rate = 1.0
-  warmup_steps = 10000
+  factors = 'constant'
+  base_learning_rate = 0.001
+  warmup_steps = 0
