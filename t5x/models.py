@@ -597,7 +597,6 @@ class EncoderDecoderModel(BaseTransformerModel):
       return_intermediates: bool = False,
   ) -> Union[jnp.ndarray, Tuple[jnp.ndarray, Mapping[str, Any]]]:
     """Compute log likelihood score on a batch."""
-    print("NIMA_score_batch: EncoderDecoderModel") 
     weights = batch['decoder_loss_weights']
     target_tokens = batch['decoder_target_tokens']
 
@@ -623,12 +622,6 @@ class EncoderDecoderModel(BaseTransformerModel):
 
     # Purposefully don't use config.z_loss because that term is for training
     # stability and shouldn't affect our reported scores.
-    print("NIMA_logits: ", logits.shape)
-    print(logits[0].shape, logits[0][0][1176], logits[0][1][1176])
-    print(jax.numpy.asarray(logits))
-    for i in logits[0]:
-        print("NIMA: ", i)
-    print("NIMA_logits[0]: ", logits[0][1176])
     token_scores = -losses.cross_entropy_with_logits(
         logits,
         common_utils.onehot(
@@ -637,9 +630,11 @@ class EncoderDecoderModel(BaseTransformerModel):
 
     sequence_scores = token_scores.sum(-1)
 
+    domonot5 = True
+    if domonot5:
+        return sequence_scores, logits
     if return_intermediates:
       return sequence_scores, intermediates
-
     return sequence_scores
 
 
@@ -771,7 +766,6 @@ class DecoderOnlyModel(BaseTransformerModel):
                   batch: Mapping[str, jnp.ndarray],
                   return_intermediates: bool = False) -> jnp.ndarray:
     """Compute log likelihood score on a batch."""
-    print("NIMA_score_batch: DecoderOnlyModel") 
 
     decoder_target_tokens = batch['decoder_target_tokens']
     weights = batch['decoder_loss_weights']

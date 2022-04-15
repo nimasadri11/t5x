@@ -365,7 +365,6 @@ def infer(
     infer_step = model.predict_batch_with_aux
   else:  # mode == 'score'
     infer_step = model.score_batch
-  print("NIMA_MODE: ", mode)
 
   infer_fn = functools.partial(
       utils.get_infer_fn(
@@ -458,13 +457,19 @@ def infer(
 
       logging.info('Running inference on %d batches.', checkpoint_period)
       # Sort by and strip index.
-      nima_out = infer_fn(model_ds.enumerate(), rng=chunk_rng)
-      print("NIMA_OUT: ", nima_out)
-      inferences = [
-          x[1] for x in sorted(
-              infer_fn(model_ds.enumerate(), rng=chunk_rng), key=lambda x: x[0])
-      ]
+      domonot5 = True
+      if domonot5:
+          doc_ids = [e.decode() for e in chunk_batch[0]['doc_id'].numpy().tolist()]
+          query_ids = [e.decode() for e in chunk_batch[0]['query_id'].numpy().tolist()]
+          t5_scores = infer_fn(model_ds.enumerate(), rng=chunk_rng)
+          inferences = tf.convert_to_tensor(list(zip(t5_scores, map(int,doc_ids), map(int,query_ids))))
 
+      else:
+          inferences = [
+              x[1] for x in sorted(
+                  infer_fn(model_ds.enumerate(), rng=chunk_rng), key=lambda x: x[0])
+          ]
+#
       if jax.process_index() == 0:
         chunk_time = time.time() - chunk_tick
         logging.info('chunk completed in %02f seconds (%02f examples/sec).',

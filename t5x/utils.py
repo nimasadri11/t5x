@@ -726,6 +726,9 @@ def get_infer_fn(infer_step: InferStepCallable, batch_size: int,
 
     # Run inference for each replica set.
     batched_results, all_indices = [], []
+    domonot5 = True
+    if domonot5:
+        true_scores_list = []
     for index, infer_batch in sharded_ds.as_numpy_iterator():
       if rng is None:
         step_rng = None
@@ -737,6 +740,15 @@ def get_infer_fn(infer_step: InferStepCallable, batch_size: int,
       # returns de-sharded batched indices and result replicated on all hosts.
       batch_indices, batch_result = partitioned_infer_step(
           train_state.params, infer_batch, step_rng, index)
+      if domonot5:
+          batch_result, logits = batch_result
+          logits = np.array(logits)
+          tr = logits[:, 0, 1176]
+          fl = logits[:, 0, 6136]
+          tr_fl = np.array(list(zip(tr, fl)))
+          softmaxed = jax.nn.softmax(tr_fl)
+          true_probs = softmaxed[:,0] 
+
       logging.info('Inference of batch %s done.', index)
       # Issue asynchronous copy request which serves as prefetching to the host.
       try:
@@ -747,10 +759,11 @@ def get_infer_fn(infer_step: InferStepCallable, batch_size: int,
 
       def _assert_equal_lengths(batch_arr, batch_idx=batch_indices):
         assert len(batch_arr) == len(batch_idx)
-
       jax.tree_map(_assert_equal_lengths, batch_result)
       batched_results.append(batch_result)
       all_indices.append(batch_indices)
+      if domonot5:
+          true_scores_list.append(true_probs)
 
     logging.info('Inference of all batches done.')
     all_inferences = batched_results
@@ -759,6 +772,8 @@ def get_infer_fn(infer_step: InferStepCallable, batch_size: int,
     all_inferences = jax.tree_multimap(lambda *args: np.concatenate(args),
                                        *all_inferences)
     all_indices = np.concatenate(all_indices)
+    if domonot5:
+        true_scores_list= np.concatenate(true_scores_list)
 
     all_inferences, all_indices = _remove_padding(all_inferences, all_indices)
 
@@ -778,7 +793,12 @@ def get_infer_fn(infer_step: InferStepCallable, batch_size: int,
     indices_and_outputs = list(zip(all_indices, all_inferences))
     indices_and_outputs = jax.tree_map(lambda x: np.array(x).tolist(),
                                        indices_and_outputs)
+    if domonot5:
+        true_scores_list= jax.tree_map(lambda x: np.array(x).tolist(),
+                                           true_scores_list)
     assert len(indices_and_outputs) == original_ds_length
+    if domonot5:
+        return true_scores_list
     return indices_and_outputs
 
   return infer_fn
