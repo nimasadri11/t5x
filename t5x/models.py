@@ -26,7 +26,6 @@ from typing import Any, Callable, Mapping, MutableMapping, Optional, Tuple, Unio
 import clu.metrics as clu_metrics
 from flax import core as flax_core
 from flax import linen as nn
-from flax import optim
 from flax.core import scope as flax_scope
 from flax.training import common_utils
 import jax
@@ -36,12 +35,12 @@ import seqio
 from t5x import decoding
 from t5x import losses
 from t5x import metrics as metrics_lib
+from t5x import optimizers
 import tensorflow as tf
 import typing_extensions
 
 Array = Union[np.ndarray, jnp.ndarray, jax.pxla.ShardedDeviceArray, tf.Tensor]
 MetricsMap = metrics_lib.MetricsMap
-Optimizer = optim.Optimizer
 PyTreeDef = type(jax.tree_structure(None))
 
 
@@ -111,7 +110,7 @@ class BaseModel(abc.ABC):
 
   FEATURE_CONVERTER_CLS: Callable[..., seqio.FeatureConverter]
 
-  def __init__(self, optimizer_def: optim.OptimizerDef):
+  def __init__(self, optimizer_def: optimizers.OptimizerDefType):
     # TODO(jbulian): Move the optimizer out of the model and make it a training
     #                parameter.
     self.optimizer_def = optimizer_def
@@ -228,7 +227,7 @@ class BaseTransformerModel(BaseModel):
       module: nn.Module,
       input_vocabulary: seqio.Vocabulary,
       output_vocabulary: seqio.Vocabulary,
-      optimizer_def: optim.OptimizerDef,
+      optimizer_def: optimizers.OptimizerDefType,
       decode_fn: Optional[DecodeFnCallable] = None,
       label_smoothing: float = 0.0,
       z_loss: float = 0.0,
@@ -318,7 +317,7 @@ class EncoderDecoderModel(BaseTransformerModel):
       module: nn.Module,
       input_vocabulary: seqio.Vocabulary,
       output_vocabulary: seqio.Vocabulary,
-      optimizer_def: optim.OptimizerDef,
+      optimizer_def: optimizers.OptimizerDefType,
       decode_fn: DecodeFnCallable = decoding.beam_search,
       feature_converter_cls: Optional[Callable[...,
                                                seqio.FeatureConverter]] = None,
@@ -467,13 +466,13 @@ class EncoderDecoderModel(BaseTransformerModel):
 
     This method can be used with a customizable decoding function as long as it
     follows the signature of `DecodeFnCallable`. In order to provide a unified
-    interface for the decoding functions, we use a generic names. For example a
+    interface for the decoding functions, we use a generic names. For example, a
     beam size is a concept unique to beam search. Conceptually, it corresponds
     to the number of sequences returned by the beam search.  Therefore, the
     generic argument `num_decodes` corresponds to the beam size if
     `self._decode_fn` is a beam search. For temperature sampling, `num_decodes`
-    corresponds to the number of indepedent sequences to be sampled. Typically
-    `num_decodes = 1` is used for tempeature sampling.
+    corresponds to the number of independent sequences to be sampled. Typically
+    `num_decodes = 1` is used for temperature sampling.
 
     If `return_all_decodes = True`, the return tuple contains the predictions
     with a shape [batch, num_decodes, max_decode_len] and the scores (i.e., log
@@ -658,7 +657,7 @@ class DecoderOnlyModel(BaseTransformerModel):
       self,
       module: nn.Module,
       vocabulary: seqio.Vocabulary,
-      optimizer_def: optim.OptimizerDef,
+      optimizer_def: optimizers.OptimizerDefType,
       decode_fn: DecodeFnCallable = decoding.temperature_sample,
       inputs_bidirectional_attention: bool = False,
       feature_converter_cls: Optional[Callable[...,

@@ -28,18 +28,20 @@ from typing import Any, Callable, Iterable, Mapping, Optional, Sequence, Tuple, 
 import warnings
 
 from absl import logging
-from flax import optim
 from flax import traverse_util
 import flax.core
 from flax.core import scope as flax_scope
 from flax.linen import partitioning as flax_partitioning
 import jax
 from jax import prng
+from jax import pxla
 from jax.experimental import multihost_utils
+from jax.experimental.global_device_array import GlobalDeviceArray
 import jax.numpy as jnp
 import numpy as np
 import seqio
 from t5x import checkpoints
+from t5x import optimizers
 from t5x import partitioning
 from t5x import state_utils
 from t5x import train_state as train_state_lib
@@ -332,7 +334,7 @@ class TrainStateInitializer:
 
   # TODO(adarob): Replace input_shapes and input_types with sample batch.
   def __init__(self,
-               optimizer_def: Optional[optim.OptimizerDef],
+               optimizer_def: Optional[optimizers.OptimizerDefType],
                init_fn: InitFnCallable,
                input_shapes: Mapping[str, Array],
                partitioner: partitioning.BasePartitioner,
@@ -559,6 +561,9 @@ def log_model_info(log_file: Optional[str],
     def _log_variable(name: str, arr: Optional[np.ndarray],
                       logical_axes: Optional[partitioning.AxisNames],
                       mesh_axes: Optional[partitioning.PartitionSpec]):
+      # Log nothing on empty dict leaves, which occur with optax EmptyState().
+      if isinstance(arr, dict) and not arr:
+        return
       if arr is None:
         _log_info_and_write_to_file(writer, 'Variable    %-80s None', name)
         return
@@ -572,9 +577,10 @@ def log_model_info(log_file: Optional[str],
           writer, 'Variable %-80s size %-12s shape %-40s partition spec %s',
           name, arr.size, shape_str, mesh_axes)
 
-    jax.tree_map(_log_variable, state_utils.get_name_tree(state_dict['target']),
-                 state_dict['target'], logical_axes['target'],
-                 mesh_axes['target'])
+    jax.tree_map(
+        _log_variable,
+        state_utils.get_name_tree(state_dict['target'], keep_empty_nodes=True),
+        state_dict['target'], logical_axes['target'], mesh_axes['target'])
 
     _log_info_and_write_to_file(writer, 'Total number of parameters: %d',
                                 total_num_params)
@@ -582,8 +588,10 @@ def log_model_info(log_file: Optional[str],
     # Add a blank line between params and states.
     _log_info_and_write_to_file(writer, '')
 
-    jax.tree_map(_log_variable, state_utils.get_name_tree(state_dict['state']),
-                 state_dict['state'], logical_axes['state'], mesh_axes['state'])
+    jax.tree_map(
+        _log_variable,
+        state_utils.get_name_tree(state_dict['state'], keep_empty_nodes=True),
+        state_dict['state'], logical_axes['state'], mesh_axes['state'])
 
 
 # -----------------------------------------------------------------------------
@@ -623,7 +631,7 @@ def _remove_padding(all_inferences, all_indices):
     all_inferences in shape PyTree[total_examples, ...].
     all_indices in shape [total_exmamples].
   """
-  non_pad_idxs = np.where(all_indices >= 0)
+  non_pad_idxs = jnp.where(all_indices >= 0)
   all_indices = all_indices[non_pad_idxs]
   all_inferences = jax.tree_map(lambda x: x[non_pad_idxs], all_inferences)
   return all_inferences, all_indices
@@ -751,15 +759,21 @@ def get_infer_fn(infer_step: InferStepCallable, batch_size: int,
 
       logging.info('Inference of batch %s done.', index)
       # Issue asynchronous copy request which serves as prefetching to the host.
+      def _copy_to_host_async(x):
+        if isinstance(x, GlobalDeviceArray):
+          x.local_data(0).copy_to_host_async()  # GDA is fully replicated
+          return x.local_data(0)
+        else:
+          x.copy_to_host_async()
+          return x
+
       try:
-        jax.tree_map(lambda x: x.copy_to_host_async(), batch_result)
+        batch_result = jax.tree_map(_copy_to_host_async, batch_result)
+        batch_indices = jax.tree_map(_copy_to_host_async, batch_indices)
       except AttributeError:
         # Similar to jax.device_get, we skip transfers for non DeviceArrays.
         pass
 
-      def _assert_equal_lengths(batch_arr, batch_idx=batch_indices):
-        assert len(batch_arr) == len(batch_idx)
-      jax.tree_map(_assert_equal_lengths, batch_result)
       batched_results.append(batch_result)
       all_indices.append(batch_indices)
       if domonot5:
@@ -769,7 +783,7 @@ def get_infer_fn(infer_step: InferStepCallable, batch_size: int,
     all_inferences = batched_results
 
     # List[B * shard_count, ...] -> [B * shard_count * batch_count, ...]
-    all_inferences = jax.tree_multimap(lambda *args: np.concatenate(args),
+    all_inferences = jax.tree_multimap(lambda *args: jnp.concatenate(args),
                                        *all_inferences)
     all_indices = np.concatenate(all_indices)
     if domonot5:
@@ -791,7 +805,7 @@ def get_infer_fn(infer_step: InferStepCallable, batch_size: int,
     all_inferences = map(
         functools.partial(jax.tree_unflatten, struct), zip(*all_inferences))
     indices_and_outputs = list(zip(all_indices, all_inferences))
-    indices_and_outputs = jax.tree_map(lambda x: np.array(x).tolist(),
+    indices_and_outputs = jax.tree_map(lambda x: jnp.array(x).tolist(),
                                        indices_and_outputs)
     if domonot5:
         true_scores_list= jax.tree_map(lambda x: np.array(x).tolist(),
@@ -1099,3 +1113,15 @@ def override_params_axes_names(
   return flax.core.freeze(model_variables)
 
 
+
+
+def get_local_data(x):
+  if isinstance(x, GlobalDeviceArray):
+    return x.local_data(0)
+  elif isinstance(x, pxla.ShardedDeviceArray):
+    val = x.device_buffers[0]
+    if val.aval is None:
+      val.aval = jax.ShapedArray(val.shape, val.dtype)
+    return val
+  else:
+    return x

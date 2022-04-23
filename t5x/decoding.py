@@ -32,6 +32,11 @@ SamplingLoopState = Tuple[int, jnp.ndarray, Mapping[str, jnp.ndarray],
 # "Effective negative infinity" constant for masking in beam search.
 NEG_INF = np.array(-1.0e7)
 
+# Temperatures lower than this are considered 0.0, which is handled specially
+# with a conditional. This is to avoid numeric issues from exponentiating on
+# 1.0/temperature when temperature is close to 0.0.
+MIN_TEMPERATURE = np.array(1e-4)
+
 #------------------------------------------------------------------------------
 # Temperature Sampling
 #------------------------------------------------------------------------------
@@ -57,6 +62,8 @@ def temperature_sample(
     cache_offset: int = 0,
     initial_index: Optional[jnp.ndarray] = None,
     max_decode_steps: Optional[Union[int, jnp.ndarray]] = None,
+    max_decode_steps_hard_limit: Optional[int] = None,
+    rescale_log_probs: bool = True,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
   """Temperature sampling for language model generation.
 
@@ -214,6 +221,16 @@ def temperature_sample(
       None, it will decode until the full input shape `inputs.shape[1]` is
       filled. max_decode_steps begins counting after the prompt, so it will
       decode at most len(prompt) + max_decode_steps tokens.
+    max_decode_steps_hard_limit: int: an optional fixed hard limit on
+      max_decode_steps. If this is set (not None and > 0), and max_decode_steps
+      is also set, then max_decode_steps will be clipped to this limit. The
+      value max_decode_steps can be an ndarray, but max_decode_steps_hard_limit
+      must be a Python integer or None.
+    rescale_log_probs: bool: whether to apply temperature, topp, and topk
+      rescaling to the log probs which are returned. If True, the log_probs will
+      include these transformations (for example, with topk=1, all log_probs
+      will be identically 0.0). If False, the log_probs will not be affected,
+      and topk/topp/temperature will not affect sequence probabilities.
 
   Returns:
     A tuple (decodes, log_prob) where `decodes` is sampled sequences with shape
@@ -222,6 +239,11 @@ def temperature_sample(
   """
   if decode_rng is None:
     decode_rng = jax.random.PRNGKey(0)
+
+  if (max_decode_steps_hard_limit is not None and
+      max_decode_steps_hard_limit > 0 and max_decode_steps is not None):
+    max_decode_steps = jnp.minimum(max_decode_steps,
+                                   max_decode_steps_hard_limit)
 
   # [batch, len] -> [batch * num_decodes, len]
   expanded_inputs = flat_batch_beam_expand(inputs, num_decodes)
@@ -248,7 +270,8 @@ def temperature_sample(
       topk,
       topp,
       initial_index=initial_index,
-      max_decode_steps=max_decode_steps)
+      max_decode_steps=max_decode_steps,
+      rescale_log_probs=rescale_log_probs)
 
   batch_size = inputs.shape[0]
   # [batch * num_decodes, len] -> [batch, num_decodes, len]
@@ -278,7 +301,8 @@ def _temperature_sample_single_trial(
     topk: int = 20,
     topp: Union[float, jnp.ndarray] = 0.0,
     initial_index: Optional[jnp.ndarray] = None,
-    max_decode_steps: Optional[Union[int, jnp.ndarray]] = None) -> jnp.ndarray:
+    max_decode_steps: Optional[Union[int, jnp.ndarray]] = None,
+    rescale_log_probs: bool = True) -> jnp.ndarray:
   """A helper function for `temperature_sample`."""
 
   # We can check the values of topp and topk only if they are not dynamic.
@@ -312,9 +336,7 @@ def _temperature_sample_single_trial(
       inputs, jnp.zeros((batch_size, 2), dtype=inputs.dtype), axis=1)
   end_marker = jnp.array(eos_id)
 
-  # TODO(hwchung): handle zero temperature case in an optimized manner.
-  # Add a small number to avoid division by zero when `temperature = 0.0`.
-  temperature = jnp.asarray(temperature) + 1e-7
+  temperature = jnp.asarray(temperature)
 
   # Initialize sampling loop state.
   # initial loop PRNGKey
@@ -367,39 +389,69 @@ def _temperature_sample_single_trial(
     logits, new_cache = tokens_to_logits(cur_token, cache)
     # Sample next token from logits.
 
-    # Here we apply temperature rescaling
-    logits = logits / temperature
+    def sample_logits_with_nonzero_temperature(logits):
+      scaled_logits = logits / jnp.maximum(temperature, MIN_TEMPERATURE)
+      if topk:
+        # Get top-k logits and their indices, sample within these top-k tokens.
+        topk_logits, _ = lax.top_k(scaled_logits, topk)
+        cutoff_logit = topk_logits[:, -1, None]
+        scaled_logits = jnp.where(scaled_logits < cutoff_logit,
+                                  jnp.full_like(scaled_logits, NEG_INF),
+                                  scaled_logits)
 
-    if topk:
-      # Get top-k logits and their indices, sample within these top-k tokens.
-      topk_logits, _ = lax.top_k(logits, topk)
-      cutoff_logit = topk_logits[:, -1, None]
-      logits = jnp.where(logits < cutoff_logit, jnp.full_like(logits, NEG_INF),
-                         logits)
+      # When topp is dynamic, we always use it since we cannot check
+      # non-zeroness (but it will have no effect if topp is 0.0).
+      if _is_tracer(topp) or topp:
+        logits_sorted = jnp.sort(
+            scaled_logits, axis=-1)[:, ::-1]  # sort descending
+        sorted_cum_probs = jnp.cumsum(
+            jax.nn.softmax(logits_sorted, axis=-1), axis=-1)
+        cutoff_index = jnp.sum(sorted_cum_probs < topp, axis=-1, keepdims=True)
+        cutoff_logit = jnp.take_along_axis(logits_sorted, cutoff_index, axis=-1)
+        scaled_logits = jnp.where(scaled_logits < cutoff_logit,
+                                  jnp.full_like(scaled_logits, NEG_INF),
+                                  scaled_logits)
 
-    # When topp is dynamic, we always use it since we cannot check non-zeroness
-    # (but it will have no effect if topp is 0.0).
-    if _is_tracer(topp) or topp:
-      logits_sorted = jnp.sort(logits, axis=-1)[:, ::-1]  # sort descending
-      sorted_cum_probs = jnp.cumsum(
-          jax.nn.softmax(logits_sorted, axis=-1), axis=-1)
-      cutoff_index = jnp.sum(sorted_cum_probs < topp, axis=-1, keepdims=True)
-      cutoff_logit = jnp.take_along_axis(logits_sorted, cutoff_index, axis=-1)
-      logits = jnp.where(logits < cutoff_logit, jnp.full_like(logits, NEG_INF),
-                         logits)
+      # [batch]
+      next_token = random.categorical(rng1, scaled_logits).astype(jnp.int32)
 
-    # [batch]
-    next_token = random.categorical(rng1, logits).astype(jnp.int32)
+      # log probability of the current token conditioned on the previously
+      # sampled and prefix tokens.
+      # [batch, vocab] -> [batch, vocab]
+      if rescale_log_probs:
+        log_probs = jax.nn.log_softmax(scaled_logits)
+      else:
+        log_probs = jax.nn.log_softmax(logits)
+      # [batch, vocab] -> [batch]
+      next_log_prob = jnp.squeeze(
+          jnp.take_along_axis(
+              log_probs, jnp.expand_dims(next_token, axis=1), axis=-1),
+          axis=-1)
 
-    # log probability of the current token conditioned on the previously sampled
-    # and prefix tokens.
-    # [batch, vocab] -> [batch, vocab]
-    log_probs = jax.nn.log_softmax(logits)
-    # [batch, vocab] -> [batch]
-    next_log_prob = jnp.squeeze(
-        jnp.take_along_axis(
-            log_probs, jnp.expand_dims(next_token, axis=1), axis=-1),
-        axis=-1)
+      return (next_token, next_log_prob)
+
+    def sample_logits_with_zero_temperature(logits):
+      # For zero temperature, we always want the greedy output, regardless
+      # of the values of topk and topp.
+
+      next_token = jnp.argmax(logits, -1).astype(jnp.int32)
+
+      if rescale_log_probs:
+        next_log_prob = jnp.zeros_like(next_token, dtype=jnp.float32)
+      else:
+        log_probs = jax.nn.log_softmax(logits)
+        next_log_prob = jnp.squeeze(
+            jnp.take_along_axis(
+                log_probs, jnp.expand_dims(next_token, axis=1), axis=-1),
+            axis=-1)
+
+      return (next_token, next_log_prob)
+
+    # Perform sampling with temperature
+    (next_token,
+     next_log_prob) = lax.cond(temperature > MIN_TEMPERATURE,
+                               sample_logits_with_nonzero_temperature,
+                               sample_logits_with_zero_temperature, logits)
 
     # When different batch elements are at different points in the loop counter,
     # it is possible that an element that started at a higher index will reach
@@ -915,30 +967,11 @@ def beam_search(inputs: jnp.ndarray,
         inputs, axis=1).astype(jnp.int32)[:, :, state.cur_index + 1]
     out_of_prompt = (next_input_token == 0)
 
-    # Obtain the next token probability from `log_probs` using indexing.
-    # We expect only one beam to have non-zero probabilities. In the first step,
-    # it is the first beam, afterwards the last because the top_k beams are
-    # gathered and flipped.
-    # Note that True * n = n and False * n = 0. Effectively 0 in the first step
-    # and beam_size - 1 in any other step.
-    # {[batch, beam, ...].indexing([batch, 1], 1, [batch, 1])} --> [batch, 1]
-    non_zero_beam_index = (state.cur_index > 0) * (beam_size - 1)
-    next_input_token_probs = log_probs[
-        jnp.expand_dims(jnp.arange(batch_size), axis=-1), non_zero_beam_index,
-        next_input_token]
-
-    # The forced beam probability could become NEG_INF, making all beams
-    # equal to NEG_INF). We need to avoid this to have distinct beams when
-    # force decoding is over. Capping the forced beam probability to a small
-    # value larger than NEG_INF.
-    next_input_token_probs = lax.max(next_input_token_probs, -1.0e6)
-
-    # When forcing prompts, update log probabilities to `next_input_token_probs`
-    # for the top of the beam and -INF for the rest, effectively keeping only
-    # one beam alive.
+    # When forcing prompts, update log probabilities to `0` for the top of the
+    # beam and -INF for the rest, effectively keeping only one beam alive.
     # --> [batch, 2*beams]
     inside_prompt_log_probs = jnp.concatenate([
-        next_input_token_probs,
+        jnp.zeros((batch_size, 1), dtype=topk_log_probs.dtype),
         jnp.full_like(topk_log_probs[:, :beams_to_keep - 1], NEG_INF)
     ],
                                               axis=1)

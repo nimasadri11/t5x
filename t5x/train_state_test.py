@@ -21,6 +21,7 @@ from flax.linen import partitioning as flax_partitioning
 import jax
 import numpy as np
 from t5x import adafactor
+from t5x import optimizers
 from t5x import partitioning
 from t5x import train_state as train_state_lib
 
@@ -35,13 +36,13 @@ class FlaxOptimTrainStateTest(absltest.TestCase):
     model = nn.Dense(10)
     inputs = np.ones([2, 3], dtype=np.float32)
     params = model.init(jax.random.PRNGKey(0), inputs)['params']
-    optimizer_def = optim.Adam(learning_rate=0.1)
+    optimizer_def = optimizers.adam(0.1)
     optimizer = optimizer_def.create(params)
     flax_mutables = flax.core.freeze({'flax_mutable1': np.ones(10)})
     state = train_state_lib.FlaxOptimTrainState(
         optimizer, flax_mutables=flax_mutables)
     self.assertEqual(state.step, 0)
-    self.assertIsInstance(state._optimizer, optim.Optimizer)
+    self.assertIsInstance(state._optimizer, optimizers.Optimizer)
     self.assertEqual(state.state_dict()['flax_mutables'],
                      flax.core.unfreeze(flax_mutables))
     jax.tree_multimap(np.testing.assert_array_equal, params, state.params)
@@ -58,12 +59,12 @@ class FlaxOptimTrainStateTest(absltest.TestCase):
         },
         'mutables': np.ones(3)
     })
-    optmizer_def = optim.GradientDescent(0.42)
-    state = train_state_lib.FlaxOptimTrainState.create(optmizer_def,
+    optimizer_def = optimizers.sgd(0.42)
+    state = train_state_lib.FlaxOptimTrainState.create(optimizer_def,
                                                        model_variables)
     self.assertEqual(state.step, 0)
-    self.assertIsInstance(state._optimizer, optim.Optimizer)
-    self.assertEqual(state._optimizer.optimizer_def, optmizer_def)
+    self.assertIsInstance(state._optimizer, optimizers.Optimizer)
+    self.assertEqual(state._optimizer.optimizer_def, optimizer_def)
     jax.tree_multimap(np.testing.assert_array_equal, state.flax_mutables,
                       flax.core.freeze({'mutables': np.ones(3)}))
     jax.tree_multimap(np.testing.assert_array_equal, state.params,
@@ -85,17 +86,17 @@ class FlaxOptimTrainStateTest(absltest.TestCase):
             }
         },
     })
-    optmizer_def = adafactor.Adafactor(
+    optimizer_def = adafactor.Adafactor(
         0.42,
         logical_factor_rules={
             'vocab': FactorDim.COLUMN,
             'embed': FactorDim.ROW
         })
-    state = train_state_lib.FlaxOptimTrainState.create(optmizer_def,
+    state = train_state_lib.FlaxOptimTrainState.create(optimizer_def,
                                                        model_variables)
     self.assertEqual(state.step, 0)
-    self.assertIsInstance(state._optimizer, optim.Optimizer)
-    self.assertEqual(state._optimizer.optimizer_def, optmizer_def)
+    self.assertIsInstance(state._optimizer, optimizers.Optimizer)
+    self.assertEqual(state._optimizer.optimizer_def, optimizer_def)
     self.assertDictEqual(
         state._optimizer.optimizer_def.hyper_params.factor_map, {
             'dense/bias': (FactorDim.NONE,),
@@ -106,6 +107,57 @@ class FlaxOptimTrainStateTest(absltest.TestCase):
                       state.params)
     jax.tree_multimap(np.testing.assert_array_equal,
                       model_variables['params_axes'], state.params_axes)
+
+  def test_create_with_flax_mutables_axes(self):
+    model_variables = flax.core.freeze({
+        'params': {
+            'dense': {
+                'bias': np.zeros(4),
+                'kernel': np.zeros((2, 4))
+            }
+        },
+        'params_axes': {
+            'dense': {
+                'bias_axes': AxisMetadata(names=('embed',)),
+                'kernel_axes': AxisMetadata(names=('vocab', 'embed')),
+            }
+        },
+        'grads': {
+            'dense': {
+                'output_grad': np.zeros(4),
+            }
+        },
+        'grads_axes': {
+            'dense': {
+                'output_grad': AxisMetadata(names=('embed',)),
+            }
+        },
+    })
+    optmizer_def = adafactor.Adafactor(
+        0.42,
+        logical_factor_rules={
+            'vocab': FactorDim.COLUMN,
+            'embed': FactorDim.ROW
+        })
+    state = train_state_lib.FlaxOptimTrainState.create(optmizer_def,
+                                                       model_variables)
+    self.assertEqual(state.step, 0)
+    self.assertIsInstance(state._optimizer, optimizers.Optimizer)
+    self.assertEqual(state._optimizer.optimizer_def, optmizer_def)
+    self.assertDictEqual(
+        state._optimizer.optimizer_def.hyper_params.factor_map, {
+            'dense/bias': (FactorDim.NONE,),
+            'dense/kernel': (FactorDim.COLUMN, FactorDim.ROW)
+        })
+    self.assertEqual(state.flax_mutables,
+                     flax.core.freeze({'grads': model_variables['grads']}))
+    jax.tree_multimap(np.testing.assert_array_equal, model_variables['params'],
+                      state.params)
+    jax.tree_multimap(np.testing.assert_array_equal,
+                      model_variables['params_axes'], state.params_axes)
+    jax.tree_multimap(np.testing.assert_array_equal,
+                      model_variables['grads_axes'],
+                      state.flax_mutables_axes['grads'])
 
   def test_create_missing_params_axes(self):
     model_variables = flax.core.freeze({
@@ -145,7 +197,7 @@ class FlaxOptimTrainStateTest(absltest.TestCase):
                                                  model_variables)
 
   def test_replace_params(self):
-    optimizer_def = optim.GradientDescent(learning_rate=0.1)
+    optimizer_def = optimizers.sgd(0.1)
     optimizer = optimizer_def.create({'test': np.ones(10)})
     state = train_state_lib.FlaxOptimTrainState(optimizer)
 
@@ -159,7 +211,7 @@ class FlaxOptimTrainStateTest(absltest.TestCase):
                       new_state.state_dict())
 
   def test_replace_step(self):
-    optimizer_def = optim.Adam(learning_rate=0.1)
+    optimizer_def = optimizers.adam(0.1)
     optimizer = optimizer_def.create({'test': np.ones(10)})
     state = train_state_lib.FlaxOptimTrainState(optimizer)
 
@@ -199,6 +251,50 @@ class FlaxOptimTrainStateTest(absltest.TestCase):
             }
         },
     })
+    optimizer_def = adafactor.Adafactor(
+        0.42,
+        logical_factor_rules={
+            'vocab': FactorDim.COLUMN,
+            'embed': FactorDim.ROW
+        })
+    state = train_state_lib.FlaxOptimTrainState.create(optimizer_def,
+                                                       model_variables)
+    axes_state = state.as_logical_axes()
+    self.assertIsNone(axes_state.params_axes)
+    jax.tree_multimap(
+        np.testing.assert_array_equal, axes_state.params,
+        flax.core.freeze({
+            'dense': {
+                'bias': partitioning.PartitionSpec('embed'),
+                'kernel': partitioning.PartitionSpec('vocab', 'embed'),
+            }
+        }))
+
+  def test_as_logical_axes_with_flax_mutables(self):
+    model_variables = flax.core.freeze({
+        'params': {
+            'dense': {
+                'bias': np.zeros(4),
+                'kernel': np.zeros((2, 4))
+            }
+        },
+        'params_axes': {
+            'dense': {
+                'bias_axes': AxisMetadata(names=('embed',)),
+                'kernel_axes': AxisMetadata(names=('vocab', 'embed')),
+            }
+        },
+        'grads': {
+            'dense': {
+                'output_grad': np.zeros(4),
+            }
+        },
+        'grads_axes': {
+            'dense': {
+                'output_grad': AxisMetadata(names=('embed',)),
+            }
+        },
+    })
     optmizer_def = adafactor.Adafactor(
         0.42,
         logical_factor_rules={
@@ -210,11 +306,12 @@ class FlaxOptimTrainStateTest(absltest.TestCase):
     axes_state = state.as_logical_axes()
     self.assertIsNone(axes_state.params_axes)
     jax.tree_multimap(
-        np.testing.assert_array_equal, axes_state.params,
+        np.testing.assert_array_equal, axes_state.flax_mutables,
         flax.core.freeze({
-            'dense': {
-                'bias': partitioning.PartitionSpec('embed'),
-                'kernel': partitioning.PartitionSpec('vocab', 'embed'),
+            'grads': {
+                'dense': {
+                    'output_grad': partitioning.PartitionSpec('embed'),
+                }
             }
         }))
 
@@ -233,8 +330,8 @@ class FlaxOptimTrainStateTest(absltest.TestCase):
             }
         },
     })
-    optmizer_def = optim.GradientDescent(0.42)
-    state = train_state_lib.FlaxOptimTrainState.create(optmizer_def,
+    optimizer_def = optim.GradientDescent(0.42)
+    state = train_state_lib.FlaxOptimTrainState.create(optimizer_def,
                                                        model_variables)
     with self.assertRaisesWithLiteralMatch(
         ValueError,
@@ -252,13 +349,13 @@ class FlaxOptimTrainStateTest(absltest.TestCase):
         },
         'mutables': np.ones(3)
     })
-    optmizer_def = adafactor.Adafactor(
+    optimizer_def = adafactor.Adafactor(
         0.42,
         logical_factor_rules={
             'vocab': FactorDim.COLUMN,
             'embed': FactorDim.ROW
         })
-    state = train_state_lib.FlaxOptimTrainState.create(optmizer_def,
+    state = train_state_lib.FlaxOptimTrainState.create(optimizer_def,
                                                        model_variables)
     jax.tree_multimap(
         np.testing.assert_array_equal, state.state_dict(), {
@@ -291,13 +388,13 @@ class FlaxOptimTrainStateTest(absltest.TestCase):
         },
         'mutables': np.ones(3)
     })
-    optmizer_def = adafactor.Adafactor(
+    optimizer_def = adafactor.Adafactor(
         0.42,
         logical_factor_rules={
             'vocab': FactorDim.COLUMN,
             'embed': FactorDim.ROW
         })
-    state = train_state_lib.FlaxOptimTrainState.create(optmizer_def,
+    state = train_state_lib.FlaxOptimTrainState.create(optimizer_def,
                                                        model_variables)
     restored = state.restore_state({
         'state': {
@@ -320,8 +417,8 @@ class FlaxOptimTrainStateTest(absltest.TestCase):
     })
 
     self.assertEqual(restored.step, 1)
-    self.assertIsInstance(restored._optimizer, optim.Optimizer)
-    self.assertEqual(restored._optimizer.optimizer_def, optmizer_def)
+    self.assertIsInstance(restored._optimizer, optimizers.Optimizer)
+    self.assertEqual(restored._optimizer.optimizer_def, optimizer_def)
     jax.tree_multimap(np.testing.assert_array_equal, restored.flax_mutables,
                       flax.core.freeze({'mutables': np.zeros(3)}))
     jax.tree_multimap(np.testing.assert_array_equal, restored.params,
