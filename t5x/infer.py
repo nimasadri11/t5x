@@ -152,6 +152,35 @@ def create_task_from_tfexample_file(
   return task.name
 
 
+def merge_chunks_to_file(
+    output_dir: str,
+    output_fname: str,
+    tmp_dir: str,
+    step: Optional[int],
+) -> None:
+  """Merge the predictions from different chunks into a unified file."""
+  logging.info('Merging chunk results.')
+  # Merge chunks into single file.
+  chunk_paths = sorted(
+      gfile.glob(os.path.join(tmp_dir, f'{output_fname}-chunk?????')))
+
+  if not chunk_paths:
+    raise FileNotFoundError(
+        'No chunk results found! One possible explanation is that your '
+        'input did not contain any examples')
+
+  assert int(chunk_paths[-1][-5:]) + 1 == len(chunk_paths), (
+      f'Expecting {int(chunk_paths[-1][-5:])} chunk paths, found '
+      f'{len(chunk_paths)}')
+  output_path = os.path.join(output_dir, output_fname)
+  del step
+  with gfile.GFile(output_path, 'wb') as merged:
+    for chunk_path in chunk_paths:
+      with gfile.GFile(chunk_path, 'rb') as ef:
+        shutil.copyfileobj(ef, merged)
+  logging.info('Results written to %s.', output_path)
+
+
 def write_inferences_to_file(
     path: str,
     inferences: Sequence[Any],
@@ -160,7 +189,8 @@ def write_inferences_to_file(
     vocabulary: Optional[seqio.Vocabulary] = None,
     json_encoder_cls: Type[json.JSONEncoder] = seqio.TensorAndNumpyEncoder,
     include_all_inputs: bool = False,
-    input_fields_to_include: Optional[Sequence[str]] = None) -> None:
+    input_fields_to_include: Optional[Sequence[str]] = None,
+    output_ids: bool = False) -> None:
   """Write model predictions, along with pretokenized inputs, to JSONL file.
 
   Args:
@@ -177,6 +207,8 @@ def write_inferences_to_file(
       JSONL file (including raw tokens) in addition to the pretokenized inputs.
     input_fields_to_include: List of input fields to include in the output JSONL
       file. This list should be None if `include_all_inputs` is set to True.
+    output_ids: if True, will output the token ID sequence for the output,
+      in addition to the decoded text.
   """
   if mode in ('predict', 'predict_with_aux') and vocabulary is None:
     raise ValueError('The `vocabulary` parameter is required in `predict` and '
@@ -220,13 +252,24 @@ def write_inferences_to_file(
         assert vocabulary is not None
         json_dict['prediction'] = _json_compat(
             vocabulary.decode_tf(tf.constant(output)).numpy())
+        if output_ids:
+          pred = _json_compat(tf.constant(output).numpy())
+          # Truncate padding tokens.
+          assert isinstance(pred, list)
+          pred = pred[:pred.index(0)] if 0 in pred else pred
+          json_dict['prediction_tokens'] = pred
       elif mode == 'score':
         json_dict['score'] = _json_compat(output)
       elif mode == 'predict_with_aux':
         assert vocabulary is not None
-        pred_text, pred_aux = output
+        pred_ids, pred_aux = output
         json_dict['prediction'] = _json_compat(
-            vocabulary.decode_tf(tf.constant(pred_text)).numpy())
+            vocabulary.decode_tf(tf.constant(pred_ids)).numpy())
+        if output_ids:
+          pred = _json_compat(tf.constant(pred_ids).numpy())
+          # Truncate padding tokens.
+          pred = pred[:pred.index(0)] if 0 in pred else pred
+          json_dict['prediction_tokens'] = pred
         json_dict['aux'] = jax.tree_map(_json_compat, pred_aux)
       else:
         raise ValueError(f'Invalid mode: {mode}')
@@ -237,6 +280,8 @@ def write_inferences_to_file(
 WriteFn = Callable[
     [str, Sequence[Any], tf.data.Dataset, str, Optional[seqio.Vocabulary]],
     None]
+
+MergeFn = Callable[[str, str, str, Optional[int]], None]
 
 
 def infer(
@@ -251,9 +296,12 @@ def infer(
     shard_id: int = 0,
     num_shards: int = 1,
     merge_chunked_results: bool = True,
+    overwrite_chunks: bool = True,
     write_fn: WriteFn = write_inferences_to_file,
     checkpoint_ds_iter: bool = True,
-    fallback_init_rng: Optional[int] = None):
+    fallback_init_rng: Optional[int] = None,
+    merge_fn: MergeFn = merge_chunks_to_file,
+):
   """Infer function.
 
   Args:
@@ -273,6 +321,8 @@ def infer(
     num_shards: Total number of dataset shards to split dataset across.
     merge_chunked_results: Whether to merge results of all chunks into a single
       json file.
+    overwrite_chunks: Whether to overwrite files which are already present. Not
+      overwriting only makes sense if the setup is exactly the same.
     write_fn: Callable function used to serialized and write inferences out to
       files.
     checkpoint_ds_iter: if True, will checkpoint the dataset iterator every
@@ -283,6 +333,7 @@ def infer(
       model re-loading when utils.RestoreCheckpointConfig.fallback_to_scratch is
       set to True. If None, parameter initialization is not allowed during model
       loading and having fallback_to_scratch enabled will result in an error.
+    merge_fn: Callable function used to merge inferences from multiple files.
   """
   logging.info('Process ID: %d', jax.process_index())
   if mode not in ('predict', 'score', 'predict_with_aux'):
@@ -410,6 +461,10 @@ def infer(
         input_ckpt.read(ckpt_path).assert_consumed()
 
     output_fname = f'{task.name}-{mode}.jsonl-{shard_id:05}-of-{num_shards:05}'
+    if gfile.exists(os.path.join(output_dir,
+                                 output_fname)) and not overwrite_chunks:
+      logging.info('File %s already exists', output_fname)
+      return
     logging.info("Starting inference loop for shard %d of %d of task '%s'.",
                  shard_id, num_shards, task.name)
 
@@ -454,6 +509,11 @@ def infer(
 
       # Get a chunk-specific RNG key.
       chunk_rng = jax.random.fold_in(jax.random.PRNGKey(0), chunk)
+      chunk_path = os.path.join(tmp_dir, f'{output_fname}-chunk{chunk:05}')
+      if gfile.exists(
+          chunk_path) and not checkpoint_ds_iter and not overwrite_chunks:
+        logging.info('Skipping chunk %s. Chunk file already exists.', chunk)
+        continue
 
       logging.info('Running inference on %d batches.', checkpoint_period)
       # Sort by and strip index.
@@ -478,8 +538,6 @@ def infer(
         update_measurement_series('inference_total_sec', chunk, chunk_time)
         update_measurement_series('inference_examples_per_sec', chunk,
                                   len(inferences) / chunk_time)
-
-        chunk_path = os.path.join(tmp_dir, f'{output_fname}-chunk{chunk:05}')
 
         chunk_ckpt_path = None
         if checkpoint_ds_iter:
@@ -513,25 +571,8 @@ def infer(
     write_thread_pool.shutdown(wait=True)
 
     if jax.process_index() == 0 and merge_chunked_results:
-      logging.info('Merging chunk results.')
-      # Merge chunks into single file.
-      chunk_paths = sorted(
-          gfile.glob(os.path.join(tmp_dir, f'{output_fname}-chunk?????')))
-
-      if not chunk_paths:
-        raise FileNotFoundError(
-            'No chunk results found! One possible explanation is that your '
-            'input did not contain any examples')
-
-      assert int(chunk_paths[-1][-5:]) + 1 == len(chunk_paths), (
-          f'Expecting {int(chunk_paths[-1][-5:])} chunk paths, found '
-          f'{len(chunk_paths)}')
-      output_path = os.path.join(output_dir, output_fname)
-      with gfile.GFile(output_path, 'wb') as merged:
-        for chunk_path in chunk_paths:
-          with gfile.GFile(chunk_path, 'rb') as ef:
-            shutil.copyfileobj(ef, merged)
-      logging.info('Results written to %s.', output_path)
+      step = None if train_state is None else int(train_state.step)
+      merge_fn(output_dir, output_fname, tmp_dir, step)
       logging.info('Deleting temporary files.')
       gfile.rmtree(tmp_dir)
 

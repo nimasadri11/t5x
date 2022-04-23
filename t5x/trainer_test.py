@@ -25,12 +25,12 @@ from clu import metric_writers
 import clu.metrics
 import clu.values
 import flax
-from flax import optim
 import jax
 import jax.numpy as jnp
 import numpy as np
 from t5x import metrics as metrics_lib
 from t5x import models as models_lib
+from t5x import optimizers
 from t5x import partitioning
 from t5x import test_utils
 from t5x import train_state as train_state_lib
@@ -248,8 +248,9 @@ class MetricsManagerTest(absltest.TestCase):
       mm.flush()
 
 
-def fake_accum_grads(model, optimizer, batch, rng, num_microbatches):
-  del model, num_microbatches, rng
+def fake_accum_grads(model, optimizer, batch, rng, num_microbatches,
+                     data_partition_spec):
+  del model, num_microbatches, rng, data_partition_spec
   # Add `i` to each optimzer value.
   i = batch['i'].sum()
   grad_accum = jax.tree_map(lambda x: i, optimizer)
@@ -280,6 +281,8 @@ def fake_eval_step(model, optimizer, batch):
   return {'loss': metrics_lib.Sum(i), 'accuracy': metrics_lib.Sum(i)}
 
 
+# TODO(b/219086328): Remove temporary backwards compatibility when
+# `weight_sum` deprecation is complete.
 def fake_eval_fn_with_weight_sum(params, batch):
   del params
   # Add `i` to each metric.
@@ -299,6 +302,8 @@ def fake_eval_fn_without_weight_sum(params, batch):
   return loss, {'loss': loss, 'accuracy': metrics_lib.Sum(i)}
 
 
+# TODO(b/219086328): Remove temporary backwards compatibility when
+# `weight_sum` deprecation is complete.
 def fake_value_and_grad_fn_with_weight_sum(callable_fn, has_aux=False):
   del callable_fn, has_aux
 
@@ -309,9 +314,9 @@ def fake_value_and_grad_fn_with_weight_sum(callable_fn, has_aux=False):
     del dropout_rng, train_state_params, flax_mutables
     # Add `i` to each optimzer value.
     i = batch['i'].sum()
-    optimizer = optim.Optimizer(
-        optim.GradientDescent(),
-        state=optim.OptimizerState(
+    optimizer = optimizers.Optimizer(
+        optimizers.sgd(0.1),
+        state=optimizers.OptimizerState(
             step=0, param_states={
                 'bias': 0,
                 'kernel': 0
@@ -341,9 +346,9 @@ def fake_value_and_grad_fn_without_weight_sum(callable_fn, has_aux=False):
     del dropout_rng, train_state_params, flax_mutables
     # Add `i` to each optimzer value.
     i = batch['i'].sum()
-    optimizer = optim.Optimizer(
-        optim.GradientDescent(),
-        state=optim.OptimizerState(
+    optimizer = optimizers.Optimizer(
+        optimizers.sgd(0.1),
+        state=optimizers.OptimizerState(
             step=0, param_states={
                 'bias': 0,
                 'kernel': 0
@@ -366,9 +371,9 @@ class TrainerTest(parameterized.TestCase):
 
   def setUp(self):
     super().setUp()
-    self.init_optimizer = optim.Optimizer(
-        optim.GradientDescent(),
-        state=optim.OptimizerState(
+    self.init_optimizer = optimizers.Optimizer(
+        optimizers.sgd(0.1),
+        state=optimizers.OptimizerState(
             step=0, param_states={
                 'bias': 0,
                 'kernel': 0
@@ -859,6 +864,8 @@ class TrainerTest(parameterized.TestCase):
             'eval4': 'compiled3'
         })
 
+  # TODO(b/219086328): Remove temporary backwards compatibility when
+  # `weight_sum` deprecation is complete.
   @mock.patch('jax.value_and_grad', fake_value_and_grad_fn_with_weight_sum)
   def test_accumulate_grads_microbatched_with_weight_sum_single_batch(self):
     with warnings.catch_warnings(record=True) as warnings_list:
@@ -909,6 +916,8 @@ class TrainerTest(parameterized.TestCase):
     self.assertEqual(metrics['accuracy'].compute(), 2)
     self.assertIsNone(flax_mutables)
 
+  # TODO(b/219086328): Remove temporary backwards compatibility when
+  # `weight_sum` deprecation is complete.
   @mock.patch('jax.value_and_grad', fake_value_and_grad_fn_with_weight_sum)
   def test_accumulate_grads_microbatched_with_weight_sum_multiple_batches(self):
     with warnings.catch_warnings(record=True) as warnings_list:
@@ -956,6 +965,8 @@ class TrainerTest(parameterized.TestCase):
     self.assertEqual(metrics['accuracy'].compute(), 2)
     self.assertIsNone(flax_mutables)
 
+  # TODO(b/219086328): Remove temporary backwards compatibility when
+  # `weight_sum` deprecation is complete.
   def test_eval_step_with_weight_sum(self):
     with warnings.catch_warnings(record=True) as warnings_list:
       # Ensure all warnings are captured.
@@ -996,9 +1007,9 @@ class TrainerTest(parameterized.TestCase):
 class TrainerRngDeterminismTest(parameterized.TestCase):
 
   def create_trainer(self, step, random_seed):
-    init_optimizer = optim.Optimizer(
-        optim.GradientDescent(),
-        state=optim.OptimizerState(
+    init_optimizer = optimizers.Optimizer(
+        optimizers.sgd(0.1),
+        state=optimizers.OptimizerState(
             step=step, param_states={
                 'bias': 0,
                 'kernel': 0
@@ -1026,8 +1037,9 @@ class TrainerRngDeterminismTest(parameterized.TestCase):
   @mock.patch('t5x.trainer.apply_grads', fake_apply_grads)
   def test_rng_determinism(self, mock_accum_grads):
 
-    def fake_accum_grads_rng(model, optimizer, batch, rng, num_microbatches):
-      del model, batch, num_microbatches
+    def fake_accum_grads_rng(model, optimizer, batch, rng, num_microbatches,
+                             data_partition_spec):
+      del model, batch, num_microbatches, data_partition_spec
       # Add 1, which will increment the step as a side effect.
       grad_accum = jax.tree_map(lambda x: 1, optimizer)
       m = {'rng': metrics_lib.Sum(jnp.sum(rng))}
@@ -1053,8 +1065,9 @@ class TrainerRngDeterminismTest(parameterized.TestCase):
                                   expected_rng_sum)
 
 
-def fake_mut_accum_grads(model, optimizer, batch, rng, num_microbatches):
-  del model, num_microbatches, rng
+def fake_mut_accum_grads(model, optimizer, batch, rng, num_microbatches,
+                         data_partition_spec):
+  del model, num_microbatches, rng, data_partition_spec
   # Add `i` to each optimzer value.
   i = batch['i'].sum()
   grad_accum = jax.tree_map(lambda x: i, optimizer)
@@ -1080,9 +1093,9 @@ class MutableTrainerTest(parameterized.TestCase):
 
   def setUp(self):
     super().setUp()
-    self.init_optimizer = optim.Optimizer(
-        optim.GradientDescent(),
-        state=optim.OptimizerState(
+    self.init_optimizer = optimizers.Optimizer(
+        optimizers.sgd(0.1),
+        state=optimizers.OptimizerState(
             step=0, param_states={
                 'bias': 0,
                 'kernel': 0

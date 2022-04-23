@@ -22,13 +22,14 @@ from typing import Any, Mapping
 from absl import flags
 from absl.testing import absltest
 from absl.testing import parameterized
-from flax import optim
 from flax import serialization
+from flax import traverse_util
 from flax.metrics import tensorboard
 import jax
 import jax.numpy as jnp
 import numpy as np
 from t5x import checkpoints
+from t5x import optimizers
 from t5x import partitioning
 from t5x import state_utils
 from t5x import test_utils
@@ -56,12 +57,12 @@ def make_train_state(
     step: int,
     params: Mapping[str, Any],
     param_states: Mapping[str, Any],
-    flax_optimizer_def: optim.OptimizerDef = optim.GradientDescent()
+    flax_optimizer_def: optimizers.OptimizerDefType = optimizers.sgd(0.1)
 ) -> FlaxOptimTrainState:
   """Helper to construct a train state for testing."""
-  optimizer = optim.Optimizer(
+  optimizer = optimizers.Optimizer(
       flax_optimizer_def,
-      state=optim.OptimizerState(step=step, param_states=param_states),
+      state=optimizers.OptimizerState(step=step, param_states=param_states),
       target=params)
   return FlaxOptimTrainState(optimizer)
 
@@ -70,11 +71,12 @@ def make_train_state_multi_optimizer(params: Mapping[str, Any],
                                      param_states: Mapping[str, Any],
                                      step: int) -> FlaxOptimTrainState:
   """Helper to construct a train state with multi optimizer for testing."""
-  optimizer = optim.Optimizer(
-      optim.MultiOptimizer(
-          (optim.ModelParamTraversal(lambda path, _: 'kernel' not in path),
-           optim.GradientDescent())),
-      state=optim.OptimizerState(step=step, param_states=param_states),
+  optimizer = optimizers.Optimizer(
+      optimizers.MultiOptimizer([
+          (traverse_util.ModelParamTraversal(
+              lambda path, _: 'kernel' not in path), optimizers.sgd(0.1)),
+      ]),
+      state=optimizers.OptimizerState(step=step, param_states=param_states),
       target=params)
   return FlaxOptimTrainState(optimizer)
 
@@ -189,7 +191,7 @@ class CheckpointsTest(parameterized.TestCase):
     mesh_axes = mesh_axes or self.default_mesh_axes
     local_chunker = partitioning.LocalChunker(mesh)
 
-    class TestPartitoiner(partitioning.BasePartitioner):
+    class TestPartitioner(partitioning.BasePartitioner):
 
       def __init__(self):
         self.move_params_to_devices_calls = 0
@@ -199,6 +201,10 @@ class CheckpointsTest(parameterized.TestCase):
       @property
       def _local_chunker(self):
         return local_chunker
+
+      @property
+      def _mesh(self):
+        return mesh
 
       def partition(self,
                     fn,
@@ -218,7 +224,7 @@ class CheckpointsTest(parameterized.TestCase):
       def get_mesh_axes(self, train_state):
         return mesh_axes
 
-    return TestPartitoiner()
+    return TestPartitioner()
 
   # pylint:disable=no-value-for-parameter
   @mock.patch(
@@ -293,20 +299,20 @@ class CheckpointsTest(parameterized.TestCase):
         'state': {
             'step':
                 checkpoints._ParameterInfo(
-                    name='state/step', shape=(), ts_spec=None, local_chunk_info=None),
+                    name='state/step', shape=(), ts_spec=None, local_chunk_info=None, axes=None),
             'param_states': {
                 'bias':
                     checkpoints._ParameterInfo(
                         name='state/param_states/bias',
                         shape=(),
                         ts_spec=None,
-                        local_chunk_info=None),
+                        local_chunk_info=None, axes=None),
                 'kernel':
                     checkpoints._ParameterInfo(
                         name='state/param_states/kernel',
                         shape=(2,),
                         ts_spec=None,
-                        local_chunk_info=None)
+                        local_chunk_info=None, axes=None)
             }
         },
         'target': {
@@ -332,7 +338,7 @@ class CheckpointsTest(parameterized.TestCase):
                     local_chunk_info=partitioning.LocalChunkInfo(
                         slice=(slice(4096, 8192, None), slice(None, None,
                                                               None)),
-                        replica_id=1)),
+                        replica_id=1), axes=PartitionSpec('model', None)),
             'kernel':
                 checkpoints._ParameterInfo(
                     name='target/kernel',
@@ -354,7 +360,7 @@ class CheckpointsTest(parameterized.TestCase):
                     }),
                     local_chunk_info=partitioning.LocalChunkInfo(
                         slice=(slice(None, None, None), slice(8, 16, None)),
-                        replica_id=1))
+                        replica_id=1), axes=PartitionSpec(None, 'model'))
         }
     }  # pyformat: disable
     jax.tree_multimap(self.assertEqual, checkpointer._get_parameter_infos(),
@@ -1037,6 +1043,40 @@ class CheckpointsTest(parameterized.TestCase):
     checkpointer.save(update_train_state_step(train_state, 101))
     self.assertSequenceEqual(checkpointer.all_steps(), [42, 53, 101])
 
+  def test_save_best_checkpointer_force_keep_period(self):
+    no_partitions_partitioner = self.get_partitioner(0, 1, 1)
+    train_state = self.train_state
+
+    checkpointer = checkpoints.SaveBestCheckpointer(
+        train_state,
+        no_partitions_partitioner,
+        self.tmp_dir,
+        keep=2,
+        metric_name_to_monitor='train/accuracy',
+        metric_mode='max',
+        keep_checkpoints_without_metrics=False,
+        force_keep_period=3)
+
+    summary_writer = tensorboard.SummaryWriter(
+        os.path.join(self.tmp_dir, 'train'))
+
+    # save checkpoints 0..9 with increasing accuracy
+    dict_actual_steps = {}
+    for c in range(10):
+      checkpointer.save(update_train_state_step(train_state, c))
+      summary_writer.scalar('accuracy', c / 100, c)
+      dict_actual_steps[c] = checkpointer.all_steps()
+
+    # Check when the last step=8 is not divisible by the keep_period=3
+    actual_steps_8 = dict_actual_steps[8]
+    expected_steps_8 = [0, 3, 5, 6, 7, 8]
+    self.assertSequenceEqual(actual_steps_8, expected_steps_8)
+
+    # Check when the last step=9 is divisible by the keep_period=3
+    actual_steps_9 = dict_actual_steps[9]
+    expected_steps_9 = [0, 3, 6, 7, 8, 9]
+    self.assertSequenceEqual(actual_steps_9, expected_steps_9)
+
   @mock.patch('time.time', return_value=0)
   def test_save_best_checkpointer_missing_metrics(self, unused_mock_time):
     """Test for `keep_checkpoints_without_metrics` behavior."""
@@ -1082,9 +1122,9 @@ class CheckpointsTest(parameterized.TestCase):
   def test_assignment_map(self):
     self.validate_save(1, 1)
     # Change optimizer
-    optimizer = optim.Optimizer(
-        optim.GradientDescent(),
-        state=optim.OptimizerState(
+    optimizer = optimizers.Optimizer(
+        optimizers.sgd(0.1),
+        state=optimizers.OptimizerState(
             step=np.int32(42),
             param_states={
                 'bias': np.int32(1),
@@ -1171,9 +1211,9 @@ class CheckpointsTest(parameterized.TestCase):
   def test_assignment_map_partial_restore(self):
     self.validate_save(1, 1)
     # Change optimizer
-    optimizer = optim.Optimizer(
-        optim.GradientDescent(),
-        state=optim.OptimizerState(
+    optimizer = optimizers.Optimizer(
+        optimizers.sgd(0.1),
+        state=optimizers.OptimizerState(
             step=np.int32(42),
             param_states={
                 'bias': np.int32(1),

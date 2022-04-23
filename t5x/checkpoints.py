@@ -34,18 +34,21 @@ import os
 import re
 import subprocess
 import time
-from typing import Any, Dict, Iterable, MutableMapping, Mapping, Optional, Sequence, Tuple, List
+from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
 from absl import logging
-from flax import optim
 from flax import serialization
 from flax import traverse_util
 import jax
+import jax.config
+from jax.experimental import global_device_array as gda_lib
 from jax.experimental import multihost_utils
+from jax.experimental.gda_serialization import serialization as gda_serialization
 import jax.numpy as jnp
 import numpy as np
 from t5x import checkpoint_importer
 from t5x import checkpoint_utils
+from t5x import optimizers
 from t5x import partitioning
 from t5x import state_utils
 from t5x import train_state as train_state_lib
@@ -56,6 +59,7 @@ import typing_extensions
 from tensorboard.backend.event_processing import directory_watcher
 from tensorboard.backend.event_processing import event_file_loader
 from tensorboard.backend.event_processing import io_wrapper
+
 PartitionSpec = partitioning.PartitionSpec
 PyTreeDef = type(jax.tree_structure(None))
 LazyArray = checkpoint_importer.LazyArray
@@ -139,7 +143,9 @@ class _ParameterInfo:
   # The TensoreStore Spec containing the minimal information for read/write.
   ts_spec: Optional[ts.Spec]
   # The LocalChunkInfo for the part of the parameter local to this host.
-  local_chunk_info: partitioning.LocalChunkInfo
+  local_chunk_info: Optional[partitioning.LocalChunkInfo]
+  # PartitionSpec mesh axes
+  axes: Optional[partitioning.PartitionSpec] = None
 
 
 # Register functions with flax.serialization to handle `ts.Spec`.
@@ -179,6 +185,13 @@ def latest_step(checkpoints_dir: str) -> Optional[int]:
   return steps[-1]
 
 
+def _get_local_data(x):
+  if isinstance(x, gda_lib.GlobalDeviceArray):
+    return x.local_data(0)
+  else:
+    return x
+
+
 def get_checkpoint_dir(checkpoints_dir: str, step: int) -> str:
   """Returns path to a checkpoint dir given a parent directory and step."""
   return os.path.join(checkpoints_dir, f'checkpoint_{step}')
@@ -195,6 +208,8 @@ def _cast(target: PyTreeDef, dtype: jnp.dtype):
       return x
     elif isinstance(x, jax.ShapeDtypeStruct):
       return jax.ShapeDtypeStruct(x.shape, dtype)
+    elif isinstance(x, gda_lib.GlobalDeviceArray):
+      raise ValueError('GDA cast not supported.')
     else:
       return x.astype(dtype)
 
@@ -398,7 +413,8 @@ class Checkpointer(object):
                *,
                keep: Optional[int] = None,
                save_dtype: jnp.dtype = np.float32,
-               restore_dtype: Optional[jnp.dtype] = None):
+               restore_dtype: Optional[jnp.dtype] = None,
+               use_gda: Optional[bool] = False):
     """Checkpointer constructor.
 
     Args:
@@ -416,6 +432,8 @@ class Checkpointer(object):
       save_dtype: dtype to cast targets to before saving.
       restore_dtype: optional dtype to cast targets to after restoring. If None,
         no parameter casting is performed.
+      use_gda: if True, enabled gda_lib.GlobalDeviceArray. Note: this is
+        currently an experimental feature under development.
     """
     self._train_state = train_state
     self._partitioner = partitioner
@@ -426,6 +444,9 @@ class Checkpointer(object):
     self.restore_dtype = restore_dtype
     self._dataset_ckpt = (
         tf.train.Checkpoint(ds=dataset_iterator) if dataset_iterator else None)
+    self._use_gda = use_gda
+    if self._use_gda:
+      logging.info('Checkpointing using GDA format is enabled.')
 
     data_layout = partitioner.get_data_layout()
     self._dataset_ckpt_name = (
@@ -471,28 +492,41 @@ class Checkpointer(object):
       # info for it because it shouldn't be saved or restored.
       if arr is None:
         return None
+      # Pass-through empty dict leaves, which occur with optax EmptyState().
+      if isinstance(arr, dict) and not arr:
+        return {}
 
       if axes is None:
         return _ParameterInfo(
-            name=name, shape=arr.shape, ts_spec=None, local_chunk_info=None)
+            name=name,
+            shape=arr.shape,
+            ts_spec=None,
+            local_chunk_info=None,
+            axes=None)
 
-      local_chunk_info = self._partitioner.get_local_chunk_info(arr.shape, axes)
-      write_shape = [
-          si if sl == slice(None) else sl.stop - sl.start
-          for si, sl in zip(arr.shape, local_chunk_info.slice)
-      ]
-      # TODO(levskaya, adarob): how should we handle stacked/fused variables??
-      chunk_shape = _choose_chunk_shape(
-          write_shape,
-          target_elements=_DESIRED_CHUNK_SIZE_BYTES / arr.dtype.itemsize)
+      if self._use_gda and isinstance(arr, gda_lib.GlobalDeviceArray):
+        local_chunk_info = None
+        metadata = gda_serialization._get_metadata(arr)  # pylint: disable=protected-access
+        del metadata['dtype']
+      else:
+        local_chunk_info = self._partitioner.get_local_chunk_info(
+            arr.shape, axes)
+        write_shape = [
+            si if sl == slice(None) else sl.stop - sl.start
+            for si, sl in zip(arr.shape, local_chunk_info.slice)
+        ]
+        # TODO(levskaya, adarob): how should we handle stacked/fused variables??
+        chunk_shape = _choose_chunk_shape(
+            write_shape,
+            target_elements=_DESIRED_CHUNK_SIZE_BYTES / arr.dtype.itemsize)
 
-      metadata = {
-          'compressor': {
-              'id': 'gzip'
-          },
-          'shape': arr.shape,
-          'chunks': np.array(chunk_shape),
-      }
+        metadata = {
+            'compressor': {
+                'id': 'gzip'
+            },
+            'shape': arr.shape,
+            'chunks': np.array(chunk_shape),
+        }
 
       if self.checkpoints_dir.startswith('gs://'):
         spec = {
@@ -523,7 +557,8 @@ class Checkpointer(object):
           name,
           shape=arr.shape,
           ts_spec=ts.Spec(spec),
-          local_chunk_info=local_chunk_info)
+          local_chunk_info=local_chunk_info,
+          axes=axes)
 
     # Create a tree of param names as the keys on the path to each leaf
     # separated by "/".
@@ -577,7 +612,9 @@ class Checkpointer(object):
     """
     step = train_state.step
     step = step.get() if isinstance(step, LazyArray) else step
-    step = int(step)  # Integer, to avoid side effects in the checkpoint path.
+    step = _get_local_data(step)
+    # Integer, to avoid side effects in the checkpoint path.
+    step = int(step)
 
     # Share a timestamp across devices.
     timestamp = multihost_utils.broadcast_one_to_all(np.int32(time.time()))
@@ -617,6 +654,8 @@ class Checkpointer(object):
         f'checkpointer:tensorstore_write_complete:{tmp_dir}')
 
     if jax.process_index() == 0:
+      written_state_dict = jax.tree_map(_get_local_data, written_state_dict)
+
       # Write msgpack file in host 0 only
       msgpack_bytes = serialization.to_bytes({
           'version': VERSION,
@@ -675,11 +714,18 @@ class Checkpointer(object):
         return maybe_arr
 
       # Only write each chunk of a parameter from one host
-      if param_info.local_chunk_info.replica_id == 0:
+      if self._use_gda or param_info.local_chunk_info.replica_id == 0:
         arr = maybe_arr
 
         # Wait until memory is available.
-        n_bytes = arr.nbytes
+        if isinstance(arr, gda_lib.GlobalDeviceArray):
+          n_bytes = sum([
+              shard.data.nbytes
+              for shard in arr.local_shards
+              if shard.replica_id == 0
+          ])
+        else:
+          n_bytes = arr.nbytes
         if n_bytes > concurrent_bytes:
           logging.warning(
               'Temporarily increasing the concurrency limits from %d bytes to '
@@ -689,7 +735,8 @@ class Checkpointer(object):
 
         if isinstance(maybe_arr, LazyArray):
           arr = await arr.get_async()
-        elif not isinstance(arr, np.ndarray):
+        elif not isinstance(arr, np.ndarray) and not isinstance(
+            arr, gda_lib.GlobalDeviceArray):
           # Cast jax.DeviceArray to np.ndarray.
           arr = np.array(maybe_arr, dtype=maybe_arr.dtype)
 
@@ -712,14 +759,17 @@ class Checkpointer(object):
               'dtype': jnp.dtype(arr.dtype).name,  # dtype before cast
           }
 
-        t = await ts.open(
-            tmp_ts_spec_dict,
-            create=True,
-            open=True,
-            context=ts.Context({'file_io_concurrency': {
-                'limit': 128
-            }}))
-        await t[param_info.local_chunk_info.slice].write(arr)
+        if self._use_gda:
+          await gda_serialization.async_serialize(arr, tmp_ts_spec_dict)
+        else:
+          t = await ts.open(
+              tmp_ts_spec_dict,
+              create=True,
+              open=True,
+              context=ts.Context({'file_io_concurrency': {
+                  'limit': 128
+              }}))
+          await t[param_info.local_chunk_info.slice].write(arr)
 
         await bytes_cv.return_bytes(n_bytes)
 
@@ -915,17 +965,55 @@ class Checkpointer(object):
     return self._restore_train_state(state_dict)
 
   def _restore_train_state(
-      self, state_dict: optim.OptimizerState) -> train_state_lib.TrainState:
+      self,
+      state_dict: optimizers.OptimizerStateType) -> train_state_lib.TrainState:
     """Restores a TrainState from an Optimizer state_dict."""
     train_state = self._train_state.restore_state(state_dict)
 
-    if self._partitioner.params_on_devices:
+    if not self._use_gda and self._partitioner.params_on_devices:
       logging.info('Moving params to devices.')
       train_state_axes = self._partitioner.get_mesh_axes(train_state)
       train_state = self._partitioner.move_params_to_devices(
           train_state, train_state_axes)
 
     return train_state
+
+  def _create_lazy_awaitable_array(
+      self, param_info: _ParameterInfo, maybe_ts_spec: Any, ckpt_path: str,
+      restore_dtype: Optional[jnp.dtype]) -> LazyAwaitableArray:
+    """Creates LazyArray from tensorstore.
+
+    Does not materialize the array immediately.
+
+    Args:
+      param_info: Information about how to read the parameter, host based sliced
+        reads and the like.
+      maybe_ts_spec: The tensorstore spec to read the parameter or some other
+        object. If this is an array then we will do a host based sliced read on
+        it (provided the param_info says to). Anything else we just return.
+      ckpt_path: A base location to use when resolving the relative paths in the
+        tensorstore spec.
+      restore_dtype: type to restore as. None indicates that no cast is
+        requested.
+
+    Returns:
+      LazyArray object.
+    """
+    mesh = None
+    axes = None
+    if self._use_gda:
+      mesh = self._partitioner._mesh  # pylint: disable=protected-access
+      axes = param_info.axes
+    get_fn = functools.partial(
+        _read_ts,
+        param_info,
+        maybe_ts_spec,
+        ckpt_path=ckpt_path,
+        restore_dtype=restore_dtype,
+        mesh=mesh,
+        axes=axes)
+    return LazyAwaitableArray.from_tensor_store_spec_or_array(
+        maybe_ts_spec, get_fn, dtype=restore_dtype)
 
   def _read_state_from_tensorstore(
       self,
@@ -945,7 +1033,7 @@ class Checkpointer(object):
       restore_dtype = self.restore_dtype if k == 'target' else None
       state_dict[k] = jax.tree_multimap(
           functools.partial(
-              _create_lazy_awaitable_array,
+              self._create_lazy_awaitable_array,
               ckpt_path=ckpt_path,
               restore_dtype=restore_dtype), restore_parameter_infos[k],
           written_state_dict[k])
@@ -1064,6 +1152,9 @@ class SaveBestCheckpointer(Checkpointer):
     metric_mode: Mode to use to compare metric values. One of 'max' or 'min'.
     keep_checkpoints_without_metrics: Whether to always keep (or delete)
       checkpoints for which a metric value has not been found.
+    force_keep_period: When removing checkpoints, skip those who step is
+      divisible by force_keep_period (step % force_keep_period == 0).
+    use_gda: Enables GDA (see Checkpointer).
   """
 
   def __init__(self,
@@ -1077,7 +1168,9 @@ class SaveBestCheckpointer(Checkpointer):
                restore_dtype: Optional[jnp.dtype] = None,
                metric_name_to_monitor: str = 'train/accuracy',
                metric_mode: str = 'max',
-               keep_checkpoints_without_metrics: bool = True):
+               keep_checkpoints_without_metrics: bool = True,
+               force_keep_period: Optional[int] = None,
+               use_gda: bool = False):
     super().__init__(
         train_state,
         partitioner,
@@ -1085,7 +1178,8 @@ class SaveBestCheckpointer(Checkpointer):
         dataset_iterator,
         keep=keep,
         save_dtype=save_dtype,
-        restore_dtype=restore_dtype)
+        restore_dtype=restore_dtype,
+        use_gda=use_gda)
     if metric_mode not in ('max', 'min'):
       raise ValueError('Unsupported `metric_mode`: %s' % metric_mode)
 
@@ -1096,7 +1190,7 @@ class SaveBestCheckpointer(Checkpointer):
     self._metric_name_to_monitor = metric_name_to_monitor
     self._metric_mode = metric_mode
     self._keep_checkpoints_without_metrics = keep_checkpoints_without_metrics
-
+    self._force_keep_period = force_keep_period
     logging.info('Using SaveBestCheckpointer to keep %s best (%s) metric %s',
                  keep, metric_mode, metric_name_to_monitor)
 
@@ -1160,12 +1254,27 @@ class SaveBestCheckpointer(Checkpointer):
       return True
     return False
 
+  def _filter_out_force_keep_period_steps(self, existing_steps):
+    """Filter out steps that are divisible by keep_period excluding the last."""
+    if not existing_steps:
+      return existing_steps
+
+    # Don't filter out the last step.
+    last_step = existing_steps.pop()
+    existing_steps = [
+        s for s in existing_steps if s % self._force_keep_period != 0
+    ]
+    return existing_steps + [last_step]
+
   def _remove_old_checkpoints(self):
     """Deletes checkpoints if there are more than keep_checkpoints."""
     if not self.keep:
       return
 
     existing_steps = self.all_steps()
+    if self._force_keep_period:
+      # Ignore checkpoints whose step is divisible by the keep period.
+      existing_steps = self._filter_out_force_keep_period_steps(existing_steps)
 
     # Artificially add 1 to `keep` since we always keep the latest checkpoint.
     if len(existing_steps) <= self.keep + 1:
@@ -1222,9 +1331,16 @@ def _get_optimizer_state_dict(
                      f'Got version: {version}')
 
 
-async def _read_ts(param_info: _ParameterInfo, maybe_tspec: Any, ckpt_path: str,
-                   restore_dtype: Optional[jnp.dtype]):
+async def _read_ts(param_info: _ParameterInfo,
+                   maybe_tspec: Any,
+                   ckpt_path: str,
+                   restore_dtype: Optional[jnp.dtype] = None,
+                   mesh: Optional[gda_lib.Shape] = None,
+                   axes: Optional[gda_lib.MeshAxes] = None):
   """Read from a tensorstore.
+
+  If both `mesh` and `axes` are provided, the method will attempt to restore the
+  array as a GlobalDeviceArray.
 
   Note:
     We use param_infos as the first argument because this function is only used
@@ -1244,6 +1360,8 @@ async def _read_ts(param_info: _ParameterInfo, maybe_tspec: Any, ckpt_path: str,
     ckpt_path: A base location to use when resolving the relative paths in the
       tensorstore spec.
     restore_dtype: type to restore as. None indicates that no cast is requested.
+    mesh: Mesh object for GDA restoration.
+    axes: MeshAxes object for GDA restoration.
 
   Returns:
     The array. Depending on the value `maybe_tspec` it might be read from
@@ -1284,6 +1402,14 @@ async def _read_ts(param_info: _ParameterInfo, maybe_tspec: Any, ckpt_path: str,
                        f'{ts_spec_arr_shape} does not match expected '
                        f'{param_info.shape}.')
 
+  if ('dtype' in tmp_ts_spec_dict and tmp_ts_spec_dict['dtype']
+      == 'uint16') or ('dtype' in tmp_ts_spec_dict['metadata'] and
+                       tmp_ts_spec_dict['metadata']['dtype'] == '<u2'):
+    raise ValueError(
+        f'Found unsupported uint16 type in Tensorstore spec: {tmp_ts_spec_dict}. '
+        'Please use t5x/google/scripts/convert_uint16_checkpoint.py '
+        'to update saved types to bfloat16.')
+
   if restore_dtype is not None:
     tmp_ts_spec_dict = {
         'base': tmp_ts_spec_dict,
@@ -1291,49 +1417,18 @@ async def _read_ts(param_info: _ParameterInfo, maybe_tspec: Any, ckpt_path: str,
         'dtype': jnp.dtype(restore_dtype).name
     }
 
-  # Read the array.
-  t = await ts.open(tmp_ts_spec_dict, open=True)
-  if param_info.local_chunk_info is not None:
-    # Just read the subsection we care about.
-    t = t[param_info.local_chunk_info.slice]
-  arr = await t.read()
-  # Assume we had to cast bfloat16 to uint16 to store with zarr.
-  # TODO(ndl): remove this bitcast, as well as related bitcasts in PW code,
-  # once we're ready to deprecate T5X checkpoints with "legacy" bfloat16
-  # support.
-  if arr.dtype == np.uint16:
-    arr = arr.view(jnp.bfloat16)
+  if mesh is None or axes is None:
+    # Read the array.
+    t = await ts.open(tmp_ts_spec_dict, open=True)
+    if param_info.local_chunk_info is not None:
+      # Just read the subsection we care about.
+      t = t[param_info.local_chunk_info.slice]
+    arr = await t.read()
+  else:
+    # if provided, read as GDA
+    arr = await gda_serialization.async_deserialize(mesh, axes,
+                                                    tmp_ts_spec_dict)
   return arr
-
-
-def _create_lazy_awaitable_array(
-    param_info: _ParameterInfo, maybe_ts_spec: Any, ckpt_path: str,
-    restore_dtype: Optional[jnp.dtype]) -> LazyAwaitableArray:
-  """Creates LazyArray from tensorstore.
-
-  Does not materialize the array immediately.
-
-  Args:
-    param_info: Information about how to read the parameter, host based sliced
-      reads and the like.
-    maybe_ts_spec: The tensorstore spec to read the parameter or some other
-      object. If this is an array then we will do a host based sliced read on it
-      (provided the param_info says to). Anything else we just return.
-    ckpt_path: A base location to use when resolving the relative paths in the
-      tensorstore spec.
-    restore_dtype: type to restore as. None indicates that no cast is requested.
-
-  Returns:
-    LazyArray object.
-  """
-  get_fn = functools.partial(
-      _read_ts,
-      param_info,
-      maybe_ts_spec,
-      ckpt_path=ckpt_path,
-      restore_dtype=restore_dtype)
-  return LazyAwaitableArray.from_tensor_store_spec_or_array(
-      maybe_ts_spec, get_fn, dtype=restore_dtype)
 
 
 def fake_param_info(maybe_tspec: Any) -> Optional[_ParameterInfo]:
@@ -1355,7 +1450,8 @@ def fake_param_info(maybe_tspec: Any) -> Optional[_ParameterInfo]:
       shape=tuple(tspec.to_json()['metadata']['shape']) if tspec else None,
       # We just believe the spec in the file.
       ts_spec=tspec,
-      local_chunk_info=local_chunk_info)
+      local_chunk_info=local_chunk_info,
+      axes=None)
 
 
 def find_checkpoint(path: str, step: Optional[int] = None) -> str:
@@ -1474,6 +1570,18 @@ def load_t5x_checkpoint(
       ckpt_optimizer_state_with_specs, sep='/')
   param_infos = traverse_util.unflatten_dict(param_infos, sep='/')
 
+  def _create_lazy_awaitable_array(
+      param_info: _ParameterInfo, maybe_ts_spec: Any, ckpt_path: str,
+      restore_dtype: Optional[jnp.dtype]) -> LazyAwaitableArray:
+    get_fn = functools.partial(
+        _read_ts,
+        param_info,
+        maybe_ts_spec,
+        ckpt_path=ckpt_path,
+        restore_dtype=restore_dtype)
+    return LazyAwaitableArray.from_tensor_store_spec_or_array(
+        maybe_ts_spec, get_fn, dtype=restore_dtype)
+
   state_dict = jax.tree_multimap(
       functools.partial(
           _create_lazy_awaitable_array,
@@ -1485,4 +1593,6 @@ def load_t5x_checkpoint(
     future_state_dict = jax.tree_map(lambda x: x.get_async(), state_dict)
     state_dict = _run_future_tree(future_state_dict)
 
+  if restore_dtype is not None:
+    state_dict['target'] = _cast(state_dict['target'], restore_dtype)
   return state_dict

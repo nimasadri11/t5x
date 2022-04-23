@@ -84,6 +84,28 @@ class DecodeTest(parameterized.TestCase):
     expected = [[5, 6, 7, 2, 2], [8, 9, 3, 3, 3]]
     np.testing.assert_array_equal(expected, sampled_sequences)
 
+  def test_temperature_sample_with_zero_temperature(self):
+    batch, max_decode_len = 2, 3
+
+    def token_to_logits(ids, cache):  # pylint: disable=unused-argument
+      # Use very large logits that are close to one another.
+      logits = np.array(
+          [[1700.47, 1700.48, 1700.51, 1700.45], [3.2, 4.8, -5.3, 5.6]],
+          dtype=np.float32)
+      return logits, {}
+
+    inputs = np.zeros((batch, max_decode_len), dtype=np.int32)
+    sampled_sequences, _ = decoding._temperature_sample_single_trial(
+        inputs, {},
+        token_to_logits,
+        EOS_ID,
+        jax.random.PRNGKey(0),
+        topk=4,
+        temperature=0.0)
+
+    expected = [[2, 2, 2], [3, 3, 3]]
+    np.testing.assert_array_equal(expected, sampled_sequences)
+
   def test_temperature_sample_prefix_ending_with_eos(self):
 
     def token_to_logits(ids, cache):  # pylint: disable=unused-argument
@@ -140,6 +162,42 @@ class DecodeTest(parameterized.TestCase):
 
     expected = [[5, 1, 2, 2, 1, 0, 0], [8, 3, 3, 1, 0, 0, 0]]
     np.testing.assert_array_equal(expected, sampled_sequences)
+
+  def test_greedy_decoding_topk_sample_log_probs(self):
+
+    def token_to_logits(ids, cache):  # pylint: disable=unused-argument
+      # Sample [2, 3] with probability [0.6, 0.4].
+      logits = np.array([[-1e7, -1e7, -0.510825624, -0.916290732]],
+                        dtype=np.float32)
+      return logits, {}
+
+    inputs = np.array([[0, 2, 2, 2, 0]], dtype=np.int32)
+    sampled_sequences, sampled_log_probs = decoding._temperature_sample_single_trial(
+        inputs, {},
+        token_to_logits,
+        EOS_ID,
+        jax.random.PRNGKey(0),
+        topk=1,
+        rescale_log_probs=True)
+
+    expected_sequence = [[2, 2, 2, 2, 2]]
+    expected_log_probs = [0.0]
+    np.testing.assert_array_equal(expected_sequence, sampled_sequences)
+    np.testing.assert_array_almost_equal(expected_log_probs, sampled_log_probs)
+
+    inputs = np.array([[0, 2, 2, 3, 0]], dtype=np.int32)
+    sampled_sequences, sampled_log_probs = decoding._temperature_sample_single_trial(
+        inputs, {},
+        token_to_logits,
+        EOS_ID,
+        jax.random.PRNGKey(0),
+        topk=1,
+        rescale_log_probs=False)
+
+    expected_sequence = [[2, 2, 3, 2, 2]]
+    expected_log_probs = [-1.02165125]
+    np.testing.assert_array_equal(expected_sequence, sampled_sequences)
+    np.testing.assert_array_almost_equal(expected_log_probs, sampled_log_probs)
 
   def test_temperature_sample_log_prob(self):
     batch, max_decode_len = 2, 7
@@ -292,6 +350,35 @@ class DecodeTest(parameterized.TestCase):
           max_decode_steps=max_decode_steps)
 
     self.assertLen(token_to_logits.call_args_list, expected_calls)
+
+    expected_output = np.array([[2, 3, 3, 3, 3, 0, 0, 0],
+                                [2, 2, 3, 3, 3, 3, 0, 0]])
+    expected_output = jnp.expand_dims(expected_output, 1)
+
+    np.testing.assert_array_equal(decodes, expected_output)
+    np.testing.assert_array_equal(scores, [[0.], [0.]])
+
+  def test_temperature_sample_max_decode_steps_hard_limit(self):
+    max_decode_steps = 10
+    max_decode_steps_hard_limit = 4
+    rng0 = jax.random.PRNGKey(0)
+    inputs = np.array([[0, 2, 0, 0, 0, 0, 0, 0], [0, 2, 2, 0, 0, 0, 0, 0]],
+                      dtype=np.int32)
+
+    token_to_logits = mock.Mock()
+    token_to_logits.return_value = (np.array(
+        [[-1e7, -1e7, -1e7, 0], [-1e7, -1e7, -1e7, 0]], dtype=np.float32), {})
+
+    # to unroll while loop
+    with jax.disable_jit():
+      decodes, scores = decoding.temperature_sample(
+          inputs, {},
+          token_to_logits,
+          EOS_ID,
+          rng0,
+          topk=4,
+          max_decode_steps=max_decode_steps,
+          max_decode_steps_hard_limit=max_decode_steps_hard_limit)
 
     expected_output = np.array([[2, 3, 3, 3, 3, 0, 0, 0],
                                 [2, 2, 3, 3, 3, 3, 0, 0]])
@@ -597,7 +684,7 @@ class DecodeTest(parameterized.TestCase):
       cur_edge_potentials = jnp.take_along_axis(
           edge_potentials,
           jnp.reshape(
-              jnp.maximum(0, cur_iter[:, 0] - 1),
+              jnp.maximum(0, cur_iter[:, 0].astype(jnp.int32) - 1),
               (batch_size * beam_size, 1, 1, 1)),
           axis=1)
       cur_edge_potentials = jnp.squeeze(cur_edge_potentials, axis=1)
@@ -643,19 +730,22 @@ class DecodeTest(parameterized.TestCase):
 
   def test_beam_search_force_decode_prefix(self):
     beam_size = 2
-    batch_logits = np.array([[-1e7, -1e10, -0.1, -0.9, -1e1, -2e1, -3e1, -4e1],
-                             [-1e7, -1e10, -0.9, -0.1, -1e1, -2e1, -3e1, -4e1]],
-                            dtype=np.float32)
 
     def token_to_logits(ids, cache):  # pylint: disable=unused-argument
       # Use id 2 then 3 for batch element 0 and id 3 then 2 for element 1.
       logits = np.repeat(
-          np.expand_dims(batch_logits, axis=1), [beam_size], axis=1)
+          np.expand_dims(
+              np.array([[-1e7, -1e10, -0.1, -0.9, -1e4, -1e4, -1e4, -1e4],
+                        [-1e7, -1e10, -0.9, -0.1, -1e4, -1e4, -1e4, -1e4]],
+                       dtype=np.float32),
+              axis=1), [beam_size],
+          axis=1)
       logits = decoding.flatten_beam_dim(logits)
       return logits, {}
 
     # batch element 0 has length 1 and element 1 has length 2.
     inputs = np.array([[0, 7, 0, 0, 0], [0, 4, 5, 0, 0]], dtype=np.int32)
+    rolled_inputs = np.array([[7, 0, 0, 0, 0], [4, 5, 0, 0, 0]], dtype=np.int32)
     beam_search_sequences, decoding_scores = decoding.beam_search(
         inputs, {}, token_to_logits, EOS_ID, num_decodes=beam_size, alpha=0)
 
@@ -667,61 +757,23 @@ class DecodeTest(parameterized.TestCase):
     np.testing.assert_array_equal(expected, beam_search_sequences)
 
     expected_scores = []
-    for batch, logits in zip(expected, batch_logits):
+    batch_logits = np.array([[-1e7, -1e10, -0.1, -0.9, -1e4, -1e4, -1e4, -1e4],
+                             [-1e7, -1e10, -0.9, -0.1, -1e4, -1e4, -1e4, -1e4]],
+                            dtype=np.float32)
+    for batch, logits, prompt in zip(expected, batch_logits, rolled_inputs):
       beam_expected_scores = []
       for beam in batch:
         log_probs = jax.nn.log_softmax(logits)
-        beam_scores = [log_probs[token] for token in beam]
+        # Add them directly since they are static.
+        beam_scores = []
+        for token, prompt_token in zip(beam, prompt):
+          if prompt_token != 0:
+            beam_scores.append(0)
+          else:
+            beam_scores.append(log_probs[token])
         beam_expected_scores.append(sum(beam_scores))
       expected_scores.append(beam_expected_scores)
     np.testing.assert_allclose(expected_scores, decoding_scores, atol=1e-5)
-
-  def test_beam_search_force_decode_unlikely_prompt(self):
-    """When the forced prompts are close to NEG_INF, prob is kept non-zero."""
-    beam_size = 2
-
-    # Id 2 and 3 are non-zero probability, with 3 always chosen.
-    batch_logits = np.array([[-1e7, -1e10, -0.9, -0.1, -1e10, -1e10, -1e10]],
-                            dtype=np.float32)
-
-    def token_to_logits(ids, cache):  # pylint: disable=unused-argument
-      logits = np.repeat(
-          np.expand_dims(batch_logits, axis=1), [beam_size], axis=1)
-      logits = decoding.flatten_beam_dim(logits)
-      return logits, {}
-
-    # batch element 0 has length 3.
-    inputs = np.array([[0, 4, 5, 6, 0]], dtype=np.int32)
-    beam_search_sequences, decoding_scores = decoding.beam_search(
-        inputs, {}, token_to_logits, EOS_ID, num_decodes=beam_size)
-
-    # Prefixes are forced depending on inputs.
-    # Beam search sequences and corresponding scores are in reverse order.
-    self.assertTrue(np.all(np.diff(decoding_scores) >= 0))
-    expected = np.array([[[4, 5, 6, 2, 3], [4, 5, 6, 3, 3]]])
-    np.testing.assert_array_equal(expected, beam_search_sequences)
-
-    batch, logits = expected[0], batch_logits[0]
-    beam_expected_scores = []
-    for beam in batch:
-      log_probs = jax.nn.log_softmax(logits)
-      beam_scores = [log_probs[token] for token in beam]
-      final_score = 0
-
-      # Verify that the beam scores would have become NEG_INF.
-      self.assertLess(sum(beam_scores), -1e7)
-
-      # Verify that the beam score is capped only while forcing the prompt.
-      for force_prompt, score in zip(
-          np.concatenate([inputs[0][1:], [0]]), beam_scores):
-        final_score += score
-        if force_prompt != 0:
-          final_score = max(-1e6, final_score)
-
-      beam_expected_scores.append(final_score)
-    np.testing.assert_allclose([beam_expected_scores],
-                               decoding_scores,
-                               atol=1e-5)
 
   def test_beam_search_force_decode_no_prefix(self):
     beam_size = 2

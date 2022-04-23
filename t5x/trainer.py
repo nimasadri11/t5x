@@ -57,6 +57,7 @@ MetricValueMapType = Mapping[str, clu.values.Value]
 ModelWeights = Any
 MutableMetricMapType = Dict[str, clu.metrics.Metric]
 PyTreeDef = type(jax.tree_structure(None))
+PartitionSpec = partitioning.PartitionSpec
 
 if TYPE_CHECKING:  # See b/163639353
   cached_property = property  # pylint: disable=invalid-name
@@ -70,17 +71,9 @@ def _merge_metrics(a, b):
       lambda a, b: a.merge(b), a, b, is_leaf=metrics_lib.is_metric_obj)
 
 
-def _sda_to_da(x):
-  if not hasattr(x, "device_buffers"):
-    return x
-  return jax.interpreters.xla.make_device_array(x.aval,
-                                                x.device_buffers[0].device(),
-                                                x.device_buffers[0])
-
-
 # Merges two metrics pytrees (mapping of metric_name (str) to clu.Metric object)
 def merge_metrics(a, b):
-  a, b = jax.tree_map(_sda_to_da, (a, b))
+  a, b = jax.tree_map(utils.get_local_data, (a, b))
   return _merge_metrics(a, b)
 
 
@@ -330,11 +323,13 @@ class MetricsManager(object):
   def write_scalar(self, key: str, val: metric_writers.interface.Scalar,
                    step: int):
     """Writes scalar value to metric writers in a threadsafe manner."""
-    self.write_scalars(int(step), {key: val})
+    step = int(utils.get_local_data(step))
+    self.write_scalars(step, {key: val})
 
   def write_scalars(self, step: int,
                     scalars: Mapping[str, metric_writers.interface.Scalar]):
     """Writes scalar value to metric writers in a threadsafe manner."""
+    step = utils.get_local_data(step)
     with self._writer_lock:
       self._writer.write_scalars(step, scalars)
 
@@ -361,6 +356,7 @@ class MetricsManager(object):
       A mapping of name -> scalar value of the written summary. Only return the
         real scalar value on host 0. For other hosts, return None.
     """
+    step = utils.get_local_data(step)
 
     # Must be called in the main thread to avoid race condition.
     duration_future = self._duration_timer.stop(block_on=metrics)
@@ -371,7 +367,7 @@ class MetricsManager(object):
       fetched_metrics = jax.tree_map(jax.device_get, metrics)
 
       duration = duration_future.result()
-      # We set the duration on TimeRate metrics.
+      # We set the duration on time-related metrics.
       final_metrics = metrics_lib.set_time_metrics_duration(
           fetched_metrics, duration)
       # Set num_steps for Step metrics (AveragePerStep, StepsPerTime, ...)
@@ -383,6 +379,7 @@ class MetricsManager(object):
         assert not isinstance(x, jax.numpy.DeviceArray)
 
       jax.tree_map(_ensure_not_on_device, final_metrics)
+      final_metrics = jax.tree_map(utils.get_local_data, final_metrics)
 
       if self._summarize_fn is None:
         summary = {k: v.compute_value() for k, v in final_metrics.items()}
@@ -632,8 +629,12 @@ class BaseTrainer(abc.ABC):
 
 
 def accumulate_grads_microbatched(
-    model: models.BaseModel, train_state: train_state_lib.TrainState,
-    batch: BatchType, dropout_rng: Rng, num_microbatches: Optional[int]
+    model: models.BaseModel,
+    train_state: train_state_lib.TrainState,
+    batch: BatchType,
+    dropout_rng: Rng,
+    num_microbatches: Optional[int],
+    data_partition_spec: PartitionSpec = PartitionSpec("data"),
 ) -> Tuple[train_state_lib.TrainState, MutableMetricMapType,
            Optional[FlaxMutables]]:
   """Implements optional microbatched gradient accumulation.
@@ -648,6 +649,8 @@ def accumulate_grads_microbatched(
     dropout_rng: jax PRNGKey for dropout.
     num_microbatches: the number of microbatches to use, or None for direct
       training.
+    data_partition_spec: the PartitionSpec to use for partitioning annotations
+      on the batch.
 
   Returns:
    Accumulated gradients and incremental metrics.
@@ -742,7 +745,7 @@ def accumulate_grads_microbatched(
       # We need to annotate the microbatch sharding as we would a batch.
       mbatch = jax.tree_map(
           lambda x: partitioning.with_sharding_constraint(  # pylint: disable=g-long-lambda
-              x, partitioning.PartitionSpec("data")),
+              x, data_partition_spec),
           mbatch)
       if flax_mutables is None:
         (_, aux), grad = grad_fn(train_state.params, mbatch, sub_dropout_rng)
@@ -819,6 +822,8 @@ def apply_grads(
       grad_accum, learning_rate=learning_rate, **other_state_variables)
   metrics["learning_rate"] = clu.metrics.Average.from_model_output(
       jnp.asarray([learning_rate]))
+  metrics["learning_rate/current"] = clu.metrics.LastValue.from_model_output(
+      jnp.asarray([learning_rate]))
   if weight_metrics_computer is not None:
     metrics.update(
         weight_metrics_computer.compute_metrics(grad_accum, train_state,
@@ -842,6 +847,31 @@ def eval_step(model: models.BaseModel, train_state: train_state_lib.TrainState,
   else:
     metrics = aux
   return metrics
+
+
+def train_with_lr(
+    train_state: train_state_lib.TrainState,
+    batch: BatchType,
+    learning_rate: jnp.ndarray,
+    dropout_rng: Rng,
+    model: models.BaseModel,
+    num_microbatches: Optional[int],
+    weight_metrics_computer: Optional[WeightMetricsComputer] = None,
+    data_partition_spec: PartitionSpec = PartitionSpec("data")):
+  """Main training function with LR schedule."""
+  grad_accum, metrics, flax_mutables = (
+      accumulate_grads_microbatched(model, train_state, batch, dropout_rng,
+                                    num_microbatches, data_partition_spec))
+  new_train_state, metrics = apply_grads(
+      train_state,
+      grad_accum,
+      metrics,
+      learning_rate,
+      weight_metrics_computer,
+      other_state_variables={"flax_mutables": flax_mutables}
+      if flax_mutables else None)
+
+  return new_train_state, metrics
 
 
 class Trainer(BaseTrainer):
@@ -893,30 +923,21 @@ class Trainer(BaseTrainer):
   @cached_property
   def _partitioned_train_step(self) -> PartitionedTrainCallable:
 
-    def train_with_lr(train_state: train_state_lib.TrainState,
-                      batch: BatchType):
-
-      learning_rate = self._learning_rate_fn(train_state.step)
-      dropout_rng = self._get_step_rng(train_state.step)
-
-      grad_accum, metrics, flax_mutables = (
-          accumulate_grads_microbatched(self._model, train_state, batch,
-                                        dropout_rng, self._num_microbatches))
-      new_train_state, metrics = apply_grads(
+    def train_step(train_state: train_state_lib.TrainState, batch: BatchType):
+      return train_with_lr(
           train_state,
-          grad_accum,
-          metrics,
-          learning_rate,
-          self._weight_metrics_computer,
-          other_state_variables={"flax_mutables": flax_mutables}
-          if flax_mutables else None)
-
-      return new_train_state, metrics
+          batch,
+          learning_rate=self._learning_rate_fn(train_state.step),
+          dropout_rng=self._get_step_rng(train_state.step),
+          model=self._model,
+          num_microbatches=self._num_microbatches,
+          weight_metrics_computer=self._weight_metrics_computer,
+          data_partition_spec=self._partitioner.data_partition_spec)
 
     return self._partitioner.partition(
-        train_with_lr,
+        train_step,
         in_axis_resources=(self._train_state_axes,
-                           partitioning.PartitionSpec("data",)),
+                           self._partitioner.data_partition_spec),
         out_axis_resources=(self._train_state_axes, None),
         donate_argnums=(0,))
 
@@ -925,7 +946,7 @@ class Trainer(BaseTrainer):
     return self._partitioner.partition(
         lambda *args, **kwargs: eval_step(self._model, *args, **kwargs),
         in_axis_resources=(self._train_state_axes,
-                           partitioning.PartitionSpec("data",)),
+                           self._partitioner.data_partition_spec),
         out_axis_resources=None)
 
 
@@ -963,6 +984,9 @@ class BaseAction(abc.ABC):
       A bool indicating whether training should be halted.
     """
     raise NotImplementedError("Action must define its run method.")
+
+
+ActionMapType = Mapping[ActionMode, Sequence[BaseAction]]
 
 
 class EarlyStoppingAction(BaseAction):

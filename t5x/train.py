@@ -57,8 +57,7 @@ _ACTION_KEYS = frozenset(trainer_lib.ActionMode.__members__.keys())
 
 
 def run_actions(
-    mode: trainer_lib.ActionMode,
-    actions: Mapping[trainer_lib.ActionMode, Sequence[trainer_lib.BaseAction]],
+    mode: trainer_lib.ActionMode, actions: trainer_lib.ActionMapType,
     train_state: train_state_lib.TrainState,
     metrics_by_task: Mapping[str, trainer_lib.MetricValueMapType]) -> bool:
   """Invokes all actions on the given mode on host 0, then broadcasts to all.
@@ -109,8 +108,9 @@ def train(
     get_dataset_fn: utils.GetDatasetCallable = utils.get_dataset,
     concurrent_metrics: bool = True,
     actions: Optional[Mapping[str, Sequence[trainer_lib.BaseAction]]] = None,
-    train_eval_get_dataset_fn: Optional[utils.GetDatasetCallable] = None
-) -> Tuple[int, train_state_lib.TrainState]:
+    train_eval_get_dataset_fn: Optional[utils.GetDatasetCallable] = None,
+    run_eval_before_training: bool = False,
+    use_gda: bool = False) -> Tuple[int, train_state_lib.TrainState]:
   """Train function.
 
   Args:
@@ -159,12 +159,17 @@ def train(
     train_eval_get_dataset_fn: Optional callable use to get the train-eval
       datasets based on the DatasetConfig and shard information. If missing, it
       defaults to `get_dataset_fn`.
+    run_eval_before_training: If True, calculate training eval and inference
+      eval metrics before training begins.
+    use_gda: if True, uses GlobalDeviceArray. Experimental feature.
 
   Returns:
     The tuple of (last_step, last_train_state).
   """
   logging.info('Process ID: %d', jax.process_index())
   tf.io.gfile.makedirs(model_dir)
+
+  jax.config.update('jax_parallel_functions_output_gda', use_gda)
 
   # Each "epoch" of the training loop should be the min of the eval period,
   # checkpoint period or the full training.
@@ -337,10 +342,11 @@ def train(
         dataset_iterator=(checkpointable_train_iter
                           if checkpoint_cfg.save.save_dataset else None),
         save_dtype=checkpoint_cfg.save.dtype,
-        keep=checkpoint_cfg.save.keep)
+        keep=checkpoint_cfg.save.keep,
+        use_gda=use_gda)
 
   # Restore step from last checkpoint or set to 0 if training from scratch.
-  host_step = int(train_state.step)
+  host_step = int(utils.get_local_data(train_state.step))
 
   # ---------------------------------------------------------------------------
   # Trainer
@@ -415,6 +421,60 @@ def train(
                     'metrics computation is enabled')
 
   # ----------------------------------------------------------------------------
+  # Setup Eval Utility Functions
+  # ----------------------------------------------------------------------------
+  def _run_training_eval(first_run: bool = False):
+    if first_run:
+      logging.info('Compiling training eval loop.')
+      trainer.compile_eval({
+          task: utils.get_zeros_batch_like_dataset(ds)
+          for task, ds in train_eval_datasets.items()
+      })
+    logging.info('Computing training evaluation metrics.')
+    eval_batch_iters = {
+        task: ds.as_numpy_iterator()
+        for task, ds in train_eval_datasets.items()
+    }
+    eval_summaries = trainer.eval(eval_batch_iters)
+    trainer.stop_training = run_actions(trainer_lib.ActionMode.TRAIN_EVAL,
+                                        actions, trainer.train_state,
+                                        eval_summaries)
+
+  def _run_inference_eval():
+    """Run prediction based inference eval."""
+    if evaluator is None:
+      return
+    logging.info('Running inference evaluation.')
+    evaluate_tick = time.time()
+    all_metrics, _, _ = evaluator.evaluate(
+        compute_metrics=jax.process_index() == 0,
+        step=host_step,
+        predict_fn=functools.partial(
+            predict_fn,
+            train_state=trainer.train_state,
+            rng=jax.random.PRNGKey(0)),
+        score_fn=functools.partial(score_fn, train_state=trainer.train_state))
+    if not concurrent_metrics:
+      # Ensure metrics are finished being computed.
+      all_metrics_done = all_metrics.result() or {}
+      trainer.stop_training = run_actions(trainer_lib.ActionMode.INFER_EVAL,
+                                          actions, trainer.train_state,
+                                          all_metrics_done)
+    train_metrics.write_scalar('timing/evaluate_seconds',
+                               time.time() - evaluate_tick, host_step)
+
+  # Optionally run teacher-forcing training eval and SeqIO inference-base eval
+  # before training. Useful for testing how much a model knows before any
+  # finetuning.
+  if run_eval_before_training:
+    if train_eval_datasets:
+      logging.info('Running training eval before training.')
+      _run_training_eval(first_run=True)
+    if evaluator is not None:
+      logging.info('Running inference eval before training.')
+      _run_inference_eval()
+
+  # ----------------------------------------------------------------------------
   # Main training loop
   # ----------------------------------------------------------------------------
   logging.info('Starting training loop.')
@@ -425,6 +485,7 @@ def train(
     raise ValueError(
         f'Unexpected total_steps ({total_steps}) < checkpoint step '
         f' ({first_step}).')
+
   logging.info('Starting main loop over steps %d-%d', first_step, total_steps)
 
   steps_per_epoch = min(steps_per_epoch, total_steps)
@@ -514,51 +575,20 @@ def train(
 
     # Training Evaluation (i.e., with teacher forcing).
     if is_eval_epoch and train_eval_datasets:
-      if step_offset // eval_period <= 1:  # Maybe less if final step < period.
-        # Compile before the first run.
-        logging.info('Compiling training eval loop.')
-        trainer.compile_eval({
-            task: utils.get_zeros_batch_like_dataset(ds)
-            for task, ds in train_eval_datasets.items()
-        })
-      logging.info('Computing training evaluation metrics.')
-      eval_batch_iters = {
-          task: ds.as_numpy_iterator()
-          for task, ds in train_eval_datasets.items()
-      }
-      eval_summaries = trainer.eval(eval_batch_iters)
-      trainer.stop_training = run_actions(trainer_lib.ActionMode.TRAIN_EVAL,
-                                          actions, trainer.train_state,
-                                          eval_summaries)
+      # Maybe less if final step < period.
+      first_run = step_offset // eval_period <= 1
+      _run_training_eval(first_run and not run_eval_before_training)
 
     # Inference Evaluation (i.e., with decoding or scoring).
     if evaluator is not None:
-      logging.info('Running inference evaluation.')
-      evaluate_tick = time.time()
-      all_metrics, _, _ = evaluator.evaluate(
-          compute_metrics=jax.process_index() == 0,
-          step=host_step,
-          predict_fn=functools.partial(
-              predict_fn,
-              train_state=trainer.train_state,
-              rng=jax.random.PRNGKey(0)),
-          score_fn=functools.partial(score_fn, train_state=trainer.train_state))
-      if not concurrent_metrics:
-        # Ensure metrics are finished being computed.
-        all_metrics_done = all_metrics.result() or {}
-        trainer.stop_training = run_actions(trainer_lib.ActionMode.INFER_EVAL,
-                                            actions, trainer.train_state,
-                                            all_metrics_done)
-      train_metrics.write_scalar('timing/evaluate_seconds',
-                                 time.time() - evaluate_tick, host_step)
-      # Make sure the metrics are flushed before exiting.
-      if final_epoch:
-        all_metrics.result()
+      _run_inference_eval()
 
   # Wait until computations are done before exiting
   logging.info('Finished.')
-  multihost_utils.sync_global_devices('complete')
   trainer.close()
+  if evaluator:
+    evaluator.close()
+  multihost_utils.sync_global_devices('complete')
 
   return host_step, trainer.train_state
 
