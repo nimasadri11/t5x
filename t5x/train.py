@@ -177,7 +177,8 @@ def train(
   # divisible by this number, otherwise we fail.
   eval_enabled = (train_eval_dataset_cfg or infer_eval_dataset_cfg)
   eval_period = eval_period if eval_enabled else 0
-  checkpoint_period = checkpoint_cfg.save.period if checkpoint_cfg.save else 0
+  #checkpoint_period = checkpoint_cfg.save.period if checkpoint_cfg.save else 0
+  checkpoint_period = 200
   if eval_period or checkpoint_period:
     steps_per_epoch = min(eval_period or np.inf, checkpoint_period or np.inf)
   else:
@@ -512,6 +513,8 @@ def train(
 
   # Main Loop over "epochs".
   for epoch in range(first_epoch, num_epochs):
+    print("NIMA_EPOCH: ", epoch)
+    time.sleep(10)
     final_epoch = epoch == num_epochs - 1
     logging.info('Epoch %d of %d', epoch, num_epochs)
 

@@ -16,8 +16,10 @@ def relevance(dataset: tf.data.Dataset) -> tf.data.Dataset:
     else:
       target="false"
     to_return = {
-        'inputs': tf.strings.join(['q: ', ex['query'], 'd: ', ex['doc']]),
-        'targets': target
+        'inputs': tf.strings.join(['Query: ', ex['query'], ' Document: ', ex['doc'], ' Relevant:']),
+        'targets': target,
+        'doc_id': ex['doc_id'],
+        'query_id': ex['query_id']
     }
     
     return to_return
@@ -31,6 +33,8 @@ print("NIMA_VOCAB: ", vocabulary)
 output_features = {
     'inputs': seqio.Feature(vocabulary=vocabulary),
     'targets': seqio.Feature(vocabulary=vocabulary),
+#    'doc_id': int
+
 }
 
 seqio.TaskRegistry.add(
